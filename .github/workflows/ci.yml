@@ -92,8 +92,25 @@ jobs:
           docker run --rm -v "$PWD:/w:ro" "${{ matrix.image }}" \
             bash -c "install /w/dist/taipan /usr/local/bin/taipan && bash /w/tests/smoke.sh /usr/local/bin/taipan /w/examples"
 
+  smoke-test-windows:
+    needs: build-and-test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v5
+        with:
+          name: taipan-windows-x86_64
+          path: dist
+      # servercore is python-less but ships curl.exe/tar.exe; its version must
+      # match the host (windows-latest = Server 2025, process isolation).
+      - name: Smoke test artifact in servercore:ltsc2025
+        shell: pwsh
+        run: |
+          docker run --rm -v "${PWD}:C:\w:ro" mcr.microsoft.com/windows/servercore:ltsc2025 `
+            powershell -ExecutionPolicy Bypass -File C:\w\tests\smoke.ps1 C:\w\dist\taipan.exe C:\w\examples
+
   release:
-    needs: [build-and-test, smoke-test]
+    needs: [build-and-test, smoke-test, smoke-test-windows]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     environment: release
