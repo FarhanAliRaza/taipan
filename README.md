@@ -1,113 +1,149 @@
 # taipan
 
-`taipan` is a **single self-contained binary** (~25MB, written in
-[Zig](https://ziglang.org)) that runs Python 3.13 scripts — including
-[PEP 723](https://peps.python.org/pep-0723/) single-file scripts with inline
-dependency blocks — on a machine with **no Python installed at all**. Its only
-system dependency is libc (on Linux, `ldd` shows glibc and the loader, nothing
-else). Binaries are built for Linux (x86_64, aarch64), macOS (Apple Silicon,
-Intel), and Windows (x86_64).
+Run Python scripts anywhere, without installing Python.
 
-Think Bun, for Python scripts: copy one file anywhere, `taipan main.py`, done.
-For scripts that declare dependencies, taipan transparently provisions them into
-a content-addressed cache with [uv](https://github.com/astral-sh/uv) —
-downloading a uv binary by itself if the machine doesn't have one — then runs
-with the cache on `sys.path`. No project, no virtualenv, no lockfile step.
+`taipan` is a self-contained executable that ships with Python 3.13 and runs
+regular Python files as well as [PEP 723](https://peps.python.org/pep-0723/)
+scripts with inline dependencies. Copy it to a machine, point it at a script,
+and it is ready to go—no project setup, virtual environment, or separate Python
+installation required.
 
 ```sh
-taipan run script.py [args...]
-# `run` is optional:
+taipan script.py
+```
+
+Dependencies are installed with [uv](https://github.com/astral-sh/uv) and kept
+in a content-addressed cache. Once a dependency set has been installed, later
+runs go straight to the cached environment.
+
+## Install
+
+Download the binary for your platform from the current release:
+
+| Platform | Download |
+| --- | --- |
+| Linux x86_64 | [taipan-linux-x86_64](https://github.com/FarhanAliRaza/taipan/releases/download/v0.2.0/taipan-linux-x86_64) |
+| Linux ARM64 | [taipan-linux-aarch64](https://github.com/FarhanAliRaza/taipan/releases/download/v0.2.0/taipan-linux-aarch64) |
+| macOS Apple Silicon | [taipan-macos-aarch64](https://github.com/FarhanAliRaza/taipan/releases/download/v0.2.0/taipan-macos-aarch64) |
+| macOS Intel | [taipan-macos-x86_64](https://github.com/FarhanAliRaza/taipan/releases/download/v0.2.0/taipan-macos-x86_64) |
+| Windows x86_64 | [taipan-windows-x86_64.exe](https://github.com/FarhanAliRaza/taipan/releases/download/v0.2.0/taipan-windows-x86_64.exe) |
+
+On Linux or macOS, rename the download and make it executable:
+
+```sh
+mv taipan-<platform> taipan
+chmod +x taipan
+sudo mv taipan /usr/local/bin/
+```
+
+On Windows, rename the downloaded file to `taipan.exe` and place it somewhere
+on your `PATH`.
+
+You can also browse [all releases](https://github.com/FarhanAliRaza/taipan/releases).
+
+## Usage
+
+Pass a script followed by any arguments intended for that script:
+
+```sh
 taipan script.py [args...]
 ```
 
-Warm startup is ~9ms for a dependency-free script and ~15ms with cached PEP
-723 dependencies — 2-3x faster than `uv run` (see
-[BENCHMARKS.md](./BENCHMARKS.md)).
+The explicit `run` command works too:
+
+```sh
+taipan run script.py [args...]
+```
+
+For a script with inline dependencies:
+
+```python
+# /// script
+# dependencies = [
+#     "httpx",
+# ]
+# ///
+
+import httpx
+
+print(httpx.get("https://example.com").status_code)
+```
+
+Save it as `example.py` and run it normally:
+
+```sh
+taipan example.py
+```
+
+On the first run, taipan finds `uv` on your system or downloads a copy into its
+cache, installs the declared packages, and precompiles them. Future runs reuse
+that environment.
 
 ## How it works
 
-The binary embeds three blobs, extracted once to
-`~/.cache/taipan/runtime/cpython-3.13.14-<platform>/` on first run (atomic
-writes, ~27MB):
+The executable contains CPython, a bytecode-only standard library, and a small
+native shim. On first use, these files are extracted atomically into the taipan
+cache. The launcher then loads the bundled Python runtime and executes your
+script as `__main__`.
 
-1. **`stdlib.zip`** — the Python standard library, bytecode-only, imported
-   directly via `zipimport` (the same mechanism as Windows' embeddable
-   distribution). Trimmed of test/, tkinter, idlelib etc.
-2. **`libpython3.13.so.1.0`** (`.dylib` on macOS) — CPython itself, from
-   [python-build-standalone](https://github.com/astral-sh/python-build-standalone),
-   stripped from 241MB to 20MB at build time on Linux (the macOS dylib ships
-   pre-stripped at ~18MB).
-3. **`taipan_shim`** (`.so`/`.dylib`/`.dll`) — a small C shim owning all
-   `Python.h` usage:
-   isolated `PyConfig` (no env vars, no `site`, fully explicit `sys.path`),
-   script execution as `__main__`.
+For PEP 723 scripts, taipan reads the inline dependency block and derives a
+cache key from the runtime and sorted dependency list. A cache hit starts the
+script immediately. On a miss, taipan asks `uv` to install the packages into a
+new isolated cache directory before running the script.
 
-On Windows a fourth blob carries what POSIX builds have inside libpython: the
-stdlib's C extensions as separate `.pyd` files plus their support DLLs
-(OpenSSL, sqlite3, libffi), extracted to a `DLLs/` dir on `sys.path`.
+Compiled extension modules are supported. The bundled runtime is loaded in a
+way that allows extension wheels to resolve Python symbols just as they would
+with a conventional Python installation.
 
-At startup taipan `dlopen`s libpython with `RTLD_GLOBAL` — which is what lets
-wheels' compiled extension modules (which deliberately do not link libpython
-on Linux and macOS) resolve `Py*` symbols — then the shim, and calls its
-single entry point. On Windows the equivalent is `LoadLibrary` preloading of
-`python313.dll`, `python3.dll`, and the vcruntimes, which later loads resolve
-by module name. The Zig executable itself never links Python.
+The cache lives at `~/.cache/taipan` by default. Set `TAIPAN_CACHE` to move it,
+or `TAIPAN_UV` to use a specific `uv` executable.
 
-### The dependency cache
+## Performance
 
-1. taipan scans the script for the PEP 723 `# /// script` block and extracts the
-   quoted strings from `dependencies = [ ... ]` (deliberately not a full TOML
-   parser).
-2. Cache key: `sha256(runtime-tag + sorted deps)`, first 16 hex chars. Envs
-   live at `~/.cache/taipan/envs/<key>/`; a `.taipan-ok` marker means cache hit and
-   uv is never invoked.
-3. On a miss, taipan finds uv (`$TAIPAN_UV`, then `PATH`, then
-   `~/.cache/taipan/bin/uv`, downloading it there if absent) and runs
-   `uv pip install --python-version 3.13 --python-platform <target-triple>
-   --target <env>` — note: works without any Python interpreter on the
-   machine.
-4. The fresh env is bytecode-precompiled once, in-process, so warm runs never
-   pay source→bytecode cost.
+Warm startup is close to launching a bare Python interpreter and avoids the
+repeated environment checks made by `uv run`. See [BENCHMARKS.md](./BENCHMARKS.md)
+for the test setup, raw results, and caveats.
 
-Env vars: `TAIPAN_CACHE` overrides the cache root, `TAIPAN_UV` pins a uv binary.
+## Building from source
 
-## Build from scratch
-
-Builds are native-only (the vendored CPython must match the host). One script
-fetches the pinned toolchain for whatever platform it runs on — Linux
-x86_64/aarch64 or macOS arm64/x86_64:
+Builds are native because the bundled CPython runtime must match the host
+platform. The toolchain script supports Linux on x86_64 and ARM64, plus macOS
+on Apple Silicon and Intel.
 
 ```sh
-./tools/fetch_toolchain.sh      # Zig 0.15.2 + python-build-standalone → vendor/
-./vendor/zig/zig build          # ReleaseFast by default; binary in zig-out/bin/taipan
+./tools/fetch_toolchain.sh
+./vendor/zig/zig build
 ```
 
-The build strips libpython (Linux), compiles the stdlib to a bytecode zip
-(`tools/make_payload.sh`), builds the shim shared library, and embeds all
-three into the executable. Build-time-only requirements: `bash`, `rsync`,
-`strip` (binutils, Linux only), and the vendored python (for `compileall`).
+The resulting executable is written to `zig-out/bin/taipan`. Building requires
+`bash` and `rsync`; Linux builds also require `strip` from binutils. Zig and the
+matching standalone Python runtime are downloaded into `vendor/` by the
+toolchain script.
 
-## Current limitations
+## Roadmap
 
-- **Linux (glibc), macOS, and Windows x86_64.** No musl/Alpine yet.
-- **Zipped, bytecode-only stdlib.** Tracebacks show no source lines for
-  stdlib frames; anything that expects stdlib modules as real files on disk
-  may misbehave. `tkinter`, `idlelib`, `venv`, `ensurepip` are excluded.
-- **`sys.executable` is taipan, not python** — `multiprocessing`'s default
-  spawn method may not work; workloads forking python subprocesses need care.
-- **Minimal TOML parsing** of the PEP 723 block; `requires-python` is not
-  enforced.
-- **No lockfiles.** Deps are whatever uv resolves at first install of a given
-  dep set.
-- **First run writes ~27MB** to `~/.cache/taipan` (one-time, atomic).
+- Cache compiled scripts so warm startup does not depend on script size.
+- Freeze bootstrap modules to reduce startup time further.
+- Add `taipan build` for bundling a script and its dependencies into one file.
+- Add Windows ARM64 support.
 
-## Next steps
+## Limitations
 
-- Script bytecode cache (never parse the same script twice; warm start
-  independent of script size).
-- Frozen bootstrap modules to break the ~9ms floor.
-- `taipan build app.py` — bundle a script + resolved deps into the binary for
-  single-artifact app distribution.
-- Windows arm64.
-
-See [BENCHMARKS.md](./BENCHMARKS.md) for measurements.
+- Linux builds require glibc; musl-based distributions such as Alpine are not
+  supported yet.
+- The standard library is stored as bytecode without source. Tracebacks still
+  identify standard-library files and line numbers, but cannot display their
+  source lines. Code that expects those modules to exist as ordinary files may
+  also fail. `tkinter`, `idlelib`, `venv`, and `ensurepip` are not included.
+- `sys.executable` is not a conventional Python interpreter and may be empty.
+  Python subprocesses and `multiprocessing` with the `spawn` start method may
+  not work as expected.
+- PEP 723 parsing intentionally supports only the dependency syntax taipan
+  needs. `requires-python` is not currently enforced.
+- Dependency sets are not locked. The first installation uses whatever
+  versions `uv` resolves at that time, and that result is then cached.
+- Downloading `uv` automatically requires `curl` and `tar`; extracting it may
+  also require `gzip`. HTTPS requests rely on the operating system's CA
+  certificate store.
+- The first run extracts the bundled runtime into the local cache and therefore
+  uses additional disk space.
