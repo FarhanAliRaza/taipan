@@ -12,7 +12,7 @@ TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
 # Not needed at script runtime (or unusable from a zip): trims ~60% of size.
-EXCLUDES=(test idlelib tkinter turtledemo ensurepip venv config-3.13-x86_64-linux-gnu
+EXCLUDES=(test idlelib tkinter turtledemo ensurepip venv 'config-3.13*'
           lib-dynload site-packages __pycache__ turtle.py)
 
 RSYNC_EX=()

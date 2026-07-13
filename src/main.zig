@@ -59,9 +59,10 @@ pub fn main() !void {
         argv_z[i] = (try alloc.dupeZ(u8, a)).ptr;
     }
 
-    // libpython first with RTLD_GLOBAL so manylinux extension modules
-    // (which deliberately don't link libpython) can resolve Py* symbols;
-    // then the shim, whose rpath $ORIGIN also points at the runtime dir.
+    // libpython first with RTLD_GLOBAL so wheel extension modules (which
+    // deliberately don't link libpython on Linux and macOS) can resolve Py*
+    // symbols; then the shim, whose rpath ($ORIGIN / @loader_path) also
+    // points at the runtime dir.
     const run_file = loadShim(alloc, rt);
 
     const rc = run_file(
@@ -94,8 +95,8 @@ fn ensureRuntime(alloc: std.mem.Allocator, cache_root: []const u8) !Runtime {
     const dir = try std.fmt.allocPrint(alloc, "{s}/runtime/{s}", .{ cache_root, build_options.runtime_tag });
     const rt: Runtime = .{
         .stdlib_zip = try std.fmt.allocPrint(alloc, "{s}/stdlib.zip", .{dir}),
-        .libpython = try std.fmt.allocPrint(alloc, "{s}/libpython3.13.so.1.0", .{dir}),
-        .shim = try std.fmt.allocPrint(alloc, "{s}/libtaipan_shim.so", .{dir}),
+        .libpython = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ dir, build_options.libpython_name }),
+        .shim = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ dir, build_options.shim_name }),
     };
     const marker = try std.fmt.allocPrint(alloc, "{s}/.taipan-ok", .{dir});
 
@@ -112,7 +113,7 @@ fn ensureRuntime(alloc: std.mem.Allocator, cache_root: []const u8) !Runtime {
 }
 
 fn extractFile(alloc: std.mem.Allocator, dest: []const u8, data: []const u8, executable: bool) !void {
-    const tmp = try std.fmt.allocPrint(alloc, "{s}.tmp.{d}", .{ dest, std.os.linux.getpid() });
+    const tmp = try std.fmt.allocPrint(alloc, "{s}.tmp.{d}", .{ dest, std.c.getpid() });
     {
         const f = try std.fs.cwd().createFile(tmp, .{ .mode = if (executable) 0o755 else 0o644 });
         defer f.close();
@@ -177,9 +178,9 @@ fn ensureEnv(alloc: std.mem.Allocator, cache_root: []const u8, deps: [][]const u
     const uv = try findUv(alloc, cache_root);
     var argv: std.ArrayList([]const u8) = .empty;
     try argv.appendSlice(alloc, &.{
-        uv,                  "pip",                      "install",
-        "--quiet",           "--python-version",         build_options.python_version,
-        "--python-platform", "x86_64-unknown-linux-gnu", "--target",
+        uv,                  "pip",                         "install",
+        "--quiet",           "--python-version",            build_options.python_version,
+        "--python-platform", build_options.python_platform, "--target",
         env_dir,
     });
     try argv.appendSlice(alloc, deps);
@@ -225,8 +226,8 @@ fn findUv(alloc: std.mem.Allocator, cache_root: []const u8) ![]const u8 {
     const bin_dir = try std.fmt.allocPrint(alloc, "{s}/bin", .{cache_root});
     try std.fs.cwd().makePath(bin_dir);
     const cmd = try std.fmt.allocPrint(alloc,
-        \\set -e; curl -fsSL https://github.com/astral-sh/uv/releases/latest/download/uv-x86_64-unknown-linux-gnu.tar.gz | tar -xz -C '{s}' --strip-components=1
-    , .{bin_dir});
+        \\set -e; curl -fsSL https://github.com/astral-sh/uv/releases/latest/download/uv-{s}.tar.gz | tar -xz -C '{s}' --strip-components=1
+    , .{ build_options.python_platform, bin_dir });
     const res = try std.process.Child.run(.{
         .allocator = alloc,
         .argv = &.{ "sh", "-c", cmd },
