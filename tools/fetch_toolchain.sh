@@ -7,6 +7,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 ZIG_VERSION=0.15.2
+ZIG_EXT=tar.xz
 PBS_TAG=20260623
 PBS_VERSION=3.13.14
 
@@ -35,13 +36,20 @@ Darwin-x86_64)
     PBS_PLAT=x86_64-apple-darwin
     PBS_SHA256=cd0023fb84de358d285c8e116cffd2f433086b943e752955dade521c12e78cab
     ;;
+MINGW*-x86_64 | MSYS*-x86_64)
+    ZIG_PLAT=x86_64-windows
+    ZIG_EXT=zip
+    ZIG_SHA256=3a0ed1e8799a2f8ce2a6e6290a9ff22e6906f8227865911fb7ddedc3cc14cb0c
+    PBS_PLAT=x86_64-pc-windows-msvc
+    PBS_SHA256=646254b53fbac69c1b3c25131c237c9136e9bbed7444123880cea8deaf555e1f
+    ;;
 *)
     echo "unsupported build platform: $(uname -s)-$(uname -m)" >&2
     exit 1
     ;;
 esac
 
-ZIG_URL="https://ziglang.org/download/${ZIG_VERSION}/zig-${ZIG_PLAT}-${ZIG_VERSION}.tar.xz"
+ZIG_URL="https://ziglang.org/download/${ZIG_VERSION}/zig-${ZIG_PLAT}-${ZIG_VERSION}.${ZIG_EXT}"
 PBS_URL="https://github.com/astral-sh/python-build-standalone/releases/download/${PBS_TAG}/cpython-${PBS_VERSION}%2B${PBS_TAG}-${PBS_PLAT}-install_only.tar.gz"
 
 sha_check() { # sha256 file — macOS has shasum, Linux has sha256sum
@@ -55,23 +63,34 @@ sha_check() { # sha256 file — macOS has shasum, Linux has sha256sum
 fetch() { # url sha256 dest-dir strip-tar-flags...
     local url="$1" sha="$2" dest="$3"; shift 3
     local tmp
-    tmp="$(mktemp)"
+    # tmp lives in the repo dir, not /tmp: on Windows the msys /tmp path is
+    # invisible to the native tar.exe used for zips.
+    tmp="$(mktemp ./toolchain.XXXXXX)"
     trap 'rm -f "$tmp"' RETURN
     echo "fetching $url" >&2
     curl -fsSL -o "$tmp" "$url"
     sha_check "$sha" "$tmp"
     mkdir -p "$dest"
-    tar -xf "$tmp" -C "$dest" "$@"
+    case "$url" in
+    *.zip) # git-bash GNU tar can't read zip; Windows' bsdtar can
+        /c/Windows/System32/tar.exe -xf "$tmp" -C "$dest" "$@" ;;
+    *)
+        tar -xf "$tmp" -C "$dest" "$@" ;;
+    esac
 }
 
-if [ ! -x vendor/zig/zig ]; then
+if [ ! -x vendor/zig/zig ] && [ ! -x vendor/zig/zig.exe ]; then
     fetch "$ZIG_URL" "$ZIG_SHA256" vendor/zig --strip-components=1
 fi
 vendor/zig/zig version >&2
 
-if [ ! -x vendor/cpython/bin/python3 ]; then
+if [ ! -x vendor/cpython/bin/python3 ] && [ ! -x vendor/cpython/python.exe ]; then
     fetch "$PBS_URL" "$PBS_SHA256" vendor/cpython --strip-components=1
 fi
-vendor/cpython/bin/python3 --version >&2
+if [ -x vendor/cpython/python.exe ]; then
+    vendor/cpython/python.exe --version >&2
+else
+    vendor/cpython/bin/python3 --version >&2
+fi
 
 echo "toolchain ready" >&2

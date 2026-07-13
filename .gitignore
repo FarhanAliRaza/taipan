@@ -3,3 +3,5 @@ zig-out/
 .zig-cache/
 __pycache__/
 bench-results.md
+toolchain.*
+.claude/

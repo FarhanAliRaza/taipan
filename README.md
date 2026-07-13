@@ -5,8 +5,8 @@
 [PEP 723](https://peps.python.org/pep-0723/) single-file scripts with inline
 dependency blocks — on a machine with **no Python installed at all**. Its only
 system dependency is libc (on Linux, `ldd` shows glibc and the loader, nothing
-else). Binaries are built for Linux (x86_64, aarch64) and macOS (Apple
-Silicon, Intel).
+else). Binaries are built for Linux (x86_64, aarch64), macOS (Apple Silicon,
+Intel), and Windows (x86_64).
 
 Think Bun, for Python scripts: copy one file anywhere, `taipan main.py`, done.
 For scripts that declare dependencies, taipan transparently provisions them into
@@ -37,15 +37,21 @@ writes, ~27MB):
    [python-build-standalone](https://github.com/astral-sh/python-build-standalone),
    stripped from 241MB to 20MB at build time on Linux (the macOS dylib ships
    pre-stripped at ~18MB).
-3. **`libtaipan_shim.so`** (`.dylib` on macOS) — a small C shim owning all
+3. **`taipan_shim`** (`.so`/`.dylib`/`.dll`) — a small C shim owning all
    `Python.h` usage:
    isolated `PyConfig` (no env vars, no `site`, fully explicit `sys.path`),
    script execution as `__main__`.
 
+On Windows a fourth blob carries what POSIX builds have inside libpython: the
+stdlib's C extensions as separate `.pyd` files plus their support DLLs
+(OpenSSL, sqlite3, libffi), extracted to a `DLLs/` dir on `sys.path`.
+
 At startup taipan `dlopen`s libpython with `RTLD_GLOBAL` — which is what lets
 wheels' compiled extension modules (which deliberately do not link libpython
 on Linux and macOS) resolve `Py*` symbols — then the shim, and calls its
-single entry point. The Zig executable itself never links Python.
+single entry point. On Windows the equivalent is `LoadLibrary` preloading of
+`python313.dll`, `python3.dll`, and the vcruntimes, which later loads resolve
+by module name. The Zig executable itself never links Python.
 
 ### The dependency cache
 
@@ -83,7 +89,7 @@ three into the executable. Build-time-only requirements: `bash`, `rsync`,
 
 ## Current limitations
 
-- **Linux (glibc) and macOS only.** No Windows or musl/Alpine yet.
+- **Linux (glibc), macOS, and Windows x86_64.** No musl/Alpine yet.
 - **Zipped, bytecode-only stdlib.** Tracebacks show no source lines for
   stdlib frames; anything that expects stdlib modules as real files on disk
   may misbehave. `tkinter`, `idlelib`, `venv`, `ensurepip` are excluded.
@@ -102,6 +108,6 @@ three into the executable. Build-time-only requirements: `bash`, `rsync`,
 - Frozen bootstrap modules to break the ~9ms floor.
 - `taipan build app.py` — bundle a script + resolved deps into the binary for
   single-artifact app distribution.
-- Windows x86_64 (needs a `LoadLibrary` port of the loader and path handling).
+- Windows arm64.
 
 See [BENCHMARKS.md](./BENCHMARKS.md) for measurements.

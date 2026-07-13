@@ -1,5 +1,6 @@
 #include <Python.h>
 #include <stdio.h>
+#include <string.h>
 
 #include "embed.h"
 
@@ -33,6 +34,26 @@ int taipan_run_file(const char *stdlib_path, const char *extra_sys_path,
     config.module_search_paths_set = 1;
     status = add_search_path(&config.module_search_paths, stdlib_path);
     if (PyStatus_Exception(status)) goto fail;
+
+#ifdef MS_WINDOWS
+    /* On Windows the stdlib C extensions are separate .pyd files, extracted
+     * to a DLLs/ dir next to stdlib.zip. Their support DLLs (OpenSSL,
+     * sqlite3, libffi) sit beside them and resolve via the loader's
+     * DLL-load-dir search. Paths from the Zig side always use '/'. */
+    {
+        const char *slash = strrchr(stdlib_path, '/');
+        if (slash != NULL) {
+            char dlls_dir[4096];
+            int n = snprintf(dlls_dir, sizeof dlls_dir, "%.*s/DLLs",
+                             (int)(slash - stdlib_path), stdlib_path);
+            if (n > 0 && (size_t)n < sizeof dlls_dir) {
+                status = add_search_path(&config.module_search_paths, dlls_dir);
+                if (PyStatus_Exception(status)) goto fail;
+            }
+        }
+    }
+#endif
+
     if (extra_sys_path && extra_sys_path[0]) {
         status = add_search_path(&config.module_search_paths, extra_sys_path);
         if (PyStatus_Exception(status)) goto fail;
@@ -40,6 +61,13 @@ int taipan_run_file(const char *stdlib_path, const char *extra_sys_path,
 
     status = PyConfig_SetBytesArgv(&config, argc, argv);
     if (PyStatus_Exception(status)) goto fail;
+
+#ifdef MS_WINDOWS
+    /* Run the script via Py_RunMain instead of PyRun_SimpleFile: a FILE*
+     * must never cross the shim/python313.dll boundary (separate CRT state). */
+    status = PyConfig_SetBytesString(&config, &config.run_filename, script_path);
+    if (PyStatus_Exception(status)) goto fail;
+#endif
 
     status = Py_InitializeFromConfig(&config);
     if (PyStatus_Exception(status)) goto fail;
@@ -57,6 +85,11 @@ int taipan_run_file(const char *stdlib_path, const char *extra_sys_path,
             PyErr_Clear();
     }
 
+#ifdef MS_WINDOWS
+    /* Runs config.run_filename in __main__, finalizes, returns the exit
+     * code (SystemExit included). */
+    return Py_RunMain();
+#else
     FILE *fp = fopen(script_path, "rb");
     if (fp == NULL) {
         fprintf(stderr, "taipan: cannot open %s\n", script_path);
@@ -70,6 +103,7 @@ int taipan_run_file(const char *stdlib_path, const char *extra_sys_path,
     if (Py_FinalizeEx() < 0 && rc == 0)
         rc = 120;
     return rc != 0 ? 1 : 0;
+#endif
 
 fail:
     PyConfig_Clear(&config);
