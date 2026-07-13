@@ -54,7 +54,10 @@ jobs:
         run: ./vendor/zig/zig build test ${{ matrix.buildflags || '' }}
 
       - name: Build (release)
-        run: ./vendor/zig/zig build -Drelease=true ${{ matrix.buildflags || '' }}
+        # -Dcpu=baseline: a native build targets the build machine's exact
+        # CPU; the artifact must run on any same-arch machine (SIGILL bites
+        # otherwise — build and smoke-test runners differ per job).
+        run: ./vendor/zig/zig build -Drelease=true -Dcpu=baseline ${{ matrix.buildflags || '' }}
 
       - name: Integration tests
         run: bash tests/test.sh
