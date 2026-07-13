@@ -10,7 +10,7 @@ jobs:
   build-and-test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Cache toolchain
         uses: actions/cache@v4
@@ -38,7 +38,7 @@ jobs:
       - name: Report binary size
         run: ls -la zig-out/bin/taipan && ldd zig-out/bin/taipan
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: taipan-linux-x86_64
           path: zig-out/bin/taipan
@@ -50,7 +50,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v5
         with:
           name: taipan-linux-x86_64
       - name: Attach binary to release
