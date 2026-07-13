@@ -287,7 +287,12 @@ fn findUv(alloc: std.mem.Allocator, cache_root: []const u8) ![]const u8 {
     const archive = try std.fmt.allocPrint(alloc, "{s}/uv-download.tmp", .{bin_dir});
     try runQuiet(alloc, &.{ "curl", "-fsSL", url, "-o", archive });
     if (is_windows) {
-        try runQuiet(alloc, &.{ "tar", "-xf", archive, "-C", bin_dir });
+        // Explicitly System32's bsdtar: a PATH `tar` may be git-bash's GNU
+        // tar, which can't read zip and parses C:/... as a remote host:file.
+        const sysroot = std.process.getEnvVarOwned(alloc, "SYSTEMROOT") catch
+            try alloc.dupe(u8, "C:/Windows");
+        const systar = try std.fmt.allocPrint(alloc, "{s}/System32/tar.exe", .{sysroot});
+        try runQuiet(alloc, &.{ systar, "-xf", archive, "-C", bin_dir });
     } else {
         try runQuiet(alloc, &.{ "tar", "-xzf", archive, "-C", bin_dir, "--strip-components=1" });
     }
