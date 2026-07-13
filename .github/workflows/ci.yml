@@ -14,13 +14,25 @@ jobs:
         include:
           - runner: ubuntu-latest
             artifact: taipan-linux-x86_64
+            bin: taipan
           - runner: ubuntu-24.04-arm
             artifact: taipan-linux-aarch64
+            bin: taipan
           - runner: macos-15
             artifact: taipan-macos-aarch64
+            bin: taipan
           - runner: macos-15-intel
             artifact: taipan-macos-x86_64
+            bin: taipan
+          - runner: windows-latest
+            artifact: taipan-windows-x86_64
+            bin: taipan.exe
+            # mingw ABI: links with Zig's bundled toolchain, no MSVC needed
+            buildflags: -Dtarget=x86_64-windows-gnu
     runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v5
 
@@ -39,23 +51,23 @@ jobs:
         run: ./vendor/zig/zig fmt --check src build.zig
 
       - name: Unit tests
-        run: ./vendor/zig/zig build test
+        run: ./vendor/zig/zig build test ${{ matrix.buildflags || '' }}
 
       - name: Build (release)
-        run: ./vendor/zig/zig build -Drelease=true
+        run: ./vendor/zig/zig build -Drelease=true ${{ matrix.buildflags || '' }}
 
       - name: Integration tests
         run: bash tests/test.sh
 
       - name: Report binary size and linkage
         run: |
-          ls -la zig-out/bin/taipan
-          ldd zig-out/bin/taipan 2>/dev/null || otool -L zig-out/bin/taipan
+          ls -la zig-out/bin/${{ matrix.bin }}
+          ldd zig-out/bin/${{ matrix.bin }} 2>/dev/null || otool -L zig-out/bin/${{ matrix.bin }} 2>/dev/null || true
 
       - uses: actions/upload-artifact@v5
         with:
           name: ${{ matrix.artifact }}
-          path: zig-out/bin/taipan
+          path: zig-out/bin/${{ matrix.bin }}
 
   smoke-test:
     needs: build-and-test
@@ -96,9 +108,12 @@ jobs:
           cd dist
           for d in taipan-*/; do
             name="${d%/}"
-            mv "$d/taipan" "$name.bin"
+            src=("$d"*)
+            ext=""
+            case "${src[0]}" in *.exe) ext=".exe" ;; esac
+            mv "${src[0]}" "$name$ext.bin"
             rm -rf "$d"
-            mv "$name.bin" "$name"
+            mv "$name$ext.bin" "$name$ext"
           done
           gh release create "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" \
             --title "${GITHUB_REF_NAME}" --generate-notes taipan-* \

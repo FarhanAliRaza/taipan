@@ -5,8 +5,13 @@
 set -u
 cd "$(dirname "$0")/.."
 
-TAIPAN="${TAIPAN:-./zig-out/bin/taipan}"
+WIN=""
+case "$(uname -s)" in MINGW* | MSYS*) WIN=1 ;; esac
+
+TAIPAN="${TAIPAN:-./zig-out/bin/taipan${WIN:+.exe}}"
 WORK="$(mktemp -d)"
+# Env vars aren't path-converted by msys, so hand taipan a real Windows path.
+[ -n "$WIN" ] && WORK="$(cygpath -m "$WORK")"
 trap 'rm -rf "$WORK"' EXIT
 export TAIPAN_CACHE="$WORK/cache"
 
@@ -35,7 +40,7 @@ check "run subcommand accepted" $?
 
 # --- runtime extraction -----------------------------------------------------
 test -f "$TAIPAN_CACHE"/runtime/*/stdlib.zip && \
-    test -f "$TAIPAN_CACHE"/runtime/*/libpython3.13.* && \
+    ls "$TAIPAN_CACHE"/runtime/*/ | grep -qE 'libpython3\.13|python313\.dll' && \
     test -f "$TAIPAN_CACHE"/runtime/*/.taipan-ok
 check "runtime extracted into TAIPAN_CACHE" $?
 
@@ -86,15 +91,21 @@ check "dep env bytecode precompiled" $?
 check "compiled extension wheel loads" $?
 
 # --- isolation: no python3/uv on PATH ------------------------------------------
-ISO="$WORK/iso"
-mkdir -p "$ISO/bin" "$ISO/home"
-for t in sh curl tar gzip; do
-    p="$(command -v $t)" && ln -s "$p" "$ISO/bin/$t"
-done
-cp "$TAIPAN" "$ISO/taipan"
-env -i HOME="$ISO/home" PATH="$ISO/bin" "$ISO/taipan" examples/hello.py 2>&1 \
-    | grep -q "hello from taipan"
-check "runs dep-free with no python/uv on PATH (env -i)" $?
+# POSIX-only: on Windows the msys tools can't be meaningfully symlinked into a
+# bare PATH (they need their own DLLs), and env -i breaks Win32 API basics.
+if [ -z "$WIN" ]; then
+    ISO="$WORK/iso"
+    mkdir -p "$ISO/bin" "$ISO/home"
+    for t in sh curl tar gzip; do
+        p="$(command -v $t)" && ln -s "$p" "$ISO/bin/$t"
+    done
+    cp "$TAIPAN" "$ISO/taipan"
+    env -i HOME="$ISO/home" PATH="$ISO/bin" "$ISO/taipan" examples/hello.py 2>&1 \
+        | grep -q "hello from taipan"
+    check "runs dep-free with no python/uv on PATH (env -i)" $?
+else
+    echo "skip     isolation test (POSIX-only)"
+fi
 
 echo
 echo "passed: $pass  failed: $fail"

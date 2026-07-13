@@ -1,12 +1,18 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const build_options = @import("build_options");
 const pep723 = @import("pep723.zig");
+const tarx = @import("tarx.zig");
+
+const is_windows = builtin.os.tag == .windows;
 
 /// The full runtime, embedded and extracted to the cache on first run:
-/// bytecode-only stdlib, libpython itself, and the C shim that drives it.
+/// bytecode-only stdlib, libpython itself, the C shim that drives it, and
+/// (Windows only) a tar of the stdlib .pyd extensions and support DLLs.
 const stdlib_zip = @embedFile("stdlib_zip");
 const libpython_so = @embedFile("libpython_so");
 const shim_so = @embedFile("shim_so");
+const extra_tar = @embedFile("extra_tar");
 
 const RunFileFn = *const fn (
     stdlib_path: [*:0]const u8,
@@ -76,10 +82,25 @@ pub fn main() !void {
     std.process.exit(if (rc < 0) 1 else @intCast(@min(rc, 255)));
 }
 
+/// Cache root, always with '/' separators — they work in every Windows API
+/// and sidestep '\' escaping when paths are spliced into Python source.
 fn cacheRoot(alloc: std.mem.Allocator) ![]const u8 {
-    if (std.process.getEnvVarOwned(alloc, "TAIPAN_CACHE")) |dir| return dir else |_| {}
-    const home = try std.process.getEnvVarOwned(alloc, "HOME");
-    return std.fmt.allocPrint(alloc, "{s}/.cache/taipan", .{home});
+    const root = blk: {
+        if (std.process.getEnvVarOwned(alloc, "TAIPAN_CACHE")) |dir| break :blk dir else |_| {}
+        if (is_windows) {
+            if (std.process.getEnvVarOwned(alloc, "LOCALAPPDATA")) |dir| {
+                break :blk try std.fmt.allocPrint(alloc, "{s}/taipan", .{dir});
+            } else |_| {}
+        }
+        const home = try std.process.getEnvVarOwned(alloc, if (is_windows) "USERPROFILE" else "HOME");
+        break :blk try std.fmt.allocPrint(alloc, "{s}/.cache/taipan", .{home});
+    };
+    if (is_windows) {
+        const w = try alloc.dupe(u8, root);
+        std.mem.replaceScalar(u8, w, '\\', '/');
+        return w;
+    }
+    return root;
 }
 
 const Runtime = struct {
@@ -108,12 +129,18 @@ fn ensureRuntime(alloc: std.mem.Allocator, cache_root: []const u8) !Runtime {
     try extractFile(alloc, rt.stdlib_zip, stdlib_zip, false);
     try extractFile(alloc, rt.libpython, libpython_so, true);
     try extractFile(alloc, rt.shim, shim_so, true);
+    if (is_windows) {
+        var dest = try std.fs.cwd().openDir(dir, .{});
+        defer dest.close();
+        try tarx.extract(dest, extra_tar);
+    }
     (try std.fs.cwd().createFile(marker, .{})).close();
     return rt;
 }
 
 fn extractFile(alloc: std.mem.Allocator, dest: []const u8, data: []const u8, executable: bool) !void {
-    const tmp = try std.fmt.allocPrint(alloc, "{s}.tmp.{d}", .{ dest, std.c.getpid() });
+    const pid = if (is_windows) std.os.windows.GetCurrentProcessId() else std.c.getpid();
+    const tmp = try std.fmt.allocPrint(alloc, "{s}.tmp.{d}", .{ dest, pid });
     {
         const f = try std.fs.cwd().createFile(tmp, .{ .mode = if (executable) 0o755 else 0o644 });
         defer f.close();
@@ -132,6 +159,31 @@ fn loadShim(alloc: std.mem.Allocator, rt: Runtime) RunFileFn {
 }
 
 fn loadShimInner(alloc: std.mem.Allocator, rt: Runtime) !RunFileFn {
+    if (is_windows) {
+        // LoadLibrary world: dependencies resolve by base name against the
+        // already-loaded module list, so preload everything the shim and any
+        // wheel .pyd may import — the vcruntimes, python313.dll, and the
+        // stable-ABI forwarder python3.dll (abi3 wheels link against it).
+        const dir = std.fs.path.dirname(rt.shim).?;
+        const preload = [_][]const u8{ "vcruntime140.dll", "vcruntime140_1.dll", "python3.dll" };
+        for (preload) |name| {
+            const p = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ dir, name });
+            _ = std.DynLib.open(p) catch |err| {
+                std.debug.print("taipan: load {s}: {s}\n", .{ p, @errorName(err) });
+                return error.DlopenLibpython;
+            };
+        }
+        _ = std.DynLib.open(rt.libpython) catch |err| {
+            std.debug.print("taipan: load {s}: {s}\n", .{ rt.libpython, @errorName(err) });
+            return error.DlopenLibpython;
+        };
+        var shim = std.DynLib.open(rt.shim) catch |err| {
+            std.debug.print("taipan: load {s}: {s}\n", .{ rt.shim, @errorName(err) });
+            return error.DlopenShim;
+        };
+        return shim.lookup(RunFileFn, "taipan_run_file") orelse error.MissingSymbol;
+    }
+
     const flags: std.c.RTLD = .{ .NOW = true, .GLOBAL = true };
     if (std.c.dlopen((try alloc.dupeZ(u8, rt.libpython)).ptr, flags) == null) {
         std.debug.print("taipan: dlopen libpython: {s}\n", .{std.c.dlerror() orelse "?"});
@@ -219,18 +271,30 @@ fn findUv(alloc: std.mem.Allocator, cache_root: []const u8) ![]const u8 {
         }
     } else |_| {}
 
-    const cached = try std.fmt.allocPrint(alloc, "{s}/bin/uv", .{cache_root});
+    const cached = try std.fmt.allocPrint(alloc, "{s}/bin/{s}", .{ cache_root, if (is_windows) "uv.exe" else "uv" });
     if (std.fs.cwd().access(cached, .{})) |_| return cached else |_| {}
 
     std.debug.print("taipan: downloading uv (one-time)...\n", .{});
     const bin_dir = try std.fmt.allocPrint(alloc, "{s}/bin", .{cache_root});
     try std.fs.cwd().makePath(bin_dir);
-    const cmd = try std.fmt.allocPrint(alloc,
-        \\set -e; curl -fsSL https://github.com/astral-sh/uv/releases/latest/download/uv-{s}.tar.gz | tar -xz -C '{s}' --strip-components=1
-    , .{ build_options.python_platform, bin_dir });
+    // Windows: curl.exe and (bsd)tar.exe ship with Windows 10+; bsdtar
+    // understands zip. Backslash paths keep cmd.exe happy.
+    const argv: []const []const u8 = if (is_windows) blk: {
+        const bin_w = try alloc.dupe(u8, bin_dir);
+        std.mem.replaceScalar(u8, bin_w, '/', '\\');
+        const cmd = try std.fmt.allocPrint(alloc,
+            \\curl -fsSL https://github.com/astral-sh/uv/releases/latest/download/uv-{s}.zip -o "{s}\uv.zip" && tar -xf "{s}\uv.zip" -C "{s}" && del /q "{s}\uv.zip"
+        , .{ build_options.python_platform, bin_w, bin_w, bin_w, bin_w });
+        break :blk try alloc.dupe([]const u8, &.{ "cmd.exe", "/d", "/c", cmd });
+    } else blk: {
+        const cmd = try std.fmt.allocPrint(alloc,
+            \\set -e; curl -fsSL https://github.com/astral-sh/uv/releases/latest/download/uv-{s}.tar.gz | tar -xz -C '{s}' --strip-components=1
+        , .{ build_options.python_platform, bin_dir });
+        break :blk try alloc.dupe([]const u8, &.{ "sh", "-c", cmd });
+    };
     const res = try std.process.Child.run(.{
         .allocator = alloc,
-        .argv = &.{ "sh", "-c", cmd },
+        .argv = argv,
         .max_output_bytes = 1024 * 1024,
     });
     const ok = switch (res.term) {
