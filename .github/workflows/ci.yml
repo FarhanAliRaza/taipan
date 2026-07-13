@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache toolchain
+        uses: actions/cache@v4
+        with:
+          path: |
+            vendor/zig
+            vendor/cpython
+          key: toolchain-${{ runner.os }}-${{ hashFiles('tools/fetch_toolchain.sh') }}
+
+      - name: Fetch pinned toolchain
+        run: ./tools/fetch_toolchain.sh
+
+      - name: Check formatting
+        run: ./vendor/zig/zig fmt --check src build.zig
+
+      - name: Unit tests
+        run: ./vendor/zig/zig build test
+
+      - name: Build (release)
+        run: ./vendor/zig/zig build -Drelease=true
+
+      - name: Integration tests
+        run: bash tests/test.sh
+
+      - name: Report binary size
+        run: ls -la zig-out/bin/taipan && ldd zig-out/bin/taipan
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: taipan-linux-x86_64
+          path: zig-out/bin/taipan
+
+  release:
+    needs: build-and-test
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: taipan-linux-x86_64
+      - name: Attach binary to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mv taipan taipan-linux-x86_64
+          gh release create "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" \
+            --title "${GITHUB_REF_NAME}" --generate-notes taipan-linux-x86_64 \
+            || gh release upload "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" taipan-linux-x86_64
