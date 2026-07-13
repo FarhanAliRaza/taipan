@@ -8,7 +8,19 @@ on:
 
 jobs:
   build-and-test:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            artifact: taipan-linux-x86_64
+          - runner: ubuntu-24.04-arm
+            artifact: taipan-linux-aarch64
+          - runner: macos-15
+            artifact: taipan-macos-aarch64
+          - runner: macos-15-intel
+            artifact: taipan-macos-x86_64
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v5
 
@@ -18,7 +30,7 @@ jobs:
           path: |
             vendor/zig
             vendor/cpython
-          key: toolchain-${{ runner.os }}-${{ hashFiles('tools/fetch_toolchain.sh') }}
+          key: toolchain-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('tools/fetch_toolchain.sh') }}
 
       - name: Fetch pinned toolchain
         run: ./tools/fetch_toolchain.sh
@@ -35,26 +47,29 @@ jobs:
       - name: Integration tests
         run: bash tests/test.sh
 
-      - name: Report binary size
-        run: ls -la zig-out/bin/taipan && ldd zig-out/bin/taipan
+      - name: Report binary size and linkage
+        run: |
+          ls -la zig-out/bin/taipan
+          ldd zig-out/bin/taipan 2>/dev/null || otool -L zig-out/bin/taipan
 
       - uses: actions/upload-artifact@v5
         with:
-          name: taipan-linux-x86_64
+          name: ${{ matrix.artifact }}
           path: zig-out/bin/taipan
 
   smoke-test:
     needs: build-and-test
-    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
         image: ["debian:bookworm-slim", "ubuntu:24.04", "fedora:latest"]
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v5
       - uses: actions/download-artifact@v5
         with:
-          name: taipan-linux-x86_64
+          name: ${{ matrix.runner == 'ubuntu-latest' && 'taipan-linux-x86_64' || 'taipan-linux-aarch64' }}
           path: dist
       - name: Smoke test artifact in ${{ matrix.image }}
         run: |
@@ -72,12 +87,19 @@ jobs:
     steps:
       - uses: actions/download-artifact@v5
         with:
-          name: taipan-linux-x86_64
-      - name: Attach binary to release
+          pattern: taipan-*
+          path: dist
+      - name: Attach binaries to release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          mv taipan taipan-linux-x86_64
+          cd dist
+          for d in taipan-*/; do
+            name="${d%/}"
+            mv "$d/taipan" "$name.bin"
+            rm -rf "$d"
+            mv "$name.bin" "$name"
+          done
           gh release create "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" \
-            --title "${GITHUB_REF_NAME}" --generate-notes taipan-linux-x86_64 \
-            || gh release upload "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" taipan-linux-x86_64
+            --title "${GITHUB_REF_NAME}" --generate-notes taipan-* \
+            || gh release upload "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" taipan-*

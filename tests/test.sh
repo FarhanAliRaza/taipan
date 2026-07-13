@@ -35,7 +35,7 @@ check "run subcommand accepted" $?
 
 # --- runtime extraction -----------------------------------------------------
 test -f "$TAIPAN_CACHE"/runtime/*/stdlib.zip && \
-    test -f "$TAIPAN_CACHE"/runtime/*/libpython3.13.so.1.0 && \
+    test -f "$TAIPAN_CACHE"/runtime/*/libpython3.13.* && \
     test -f "$TAIPAN_CACHE"/runtime/*/.taipan-ok
 check "runtime extracted into TAIPAN_CACHE" $?
 
