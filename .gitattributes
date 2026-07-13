@@ -1,0 +1,3 @@
+# Never convert line endings: zig fmt requires LF, and binary fixtures
+# (src/testdata/*.tar) must be byte-exact on every platform.
+* -text
