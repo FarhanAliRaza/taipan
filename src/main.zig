@@ -277,35 +277,44 @@ fn findUv(alloc: std.mem.Allocator, cache_root: []const u8) ![]const u8 {
     std.debug.print("taipan: downloading uv (one-time)...\n", .{});
     const bin_dir = try std.fmt.allocPrint(alloc, "{s}/bin", .{cache_root});
     try std.fs.cwd().makePath(bin_dir);
-    // Windows: curl.exe and (bsd)tar.exe ship with Windows 10+; bsdtar
-    // understands zip. Backslash paths keep cmd.exe happy.
-    const argv: []const []const u8 = if (is_windows) blk: {
-        const bin_w = try alloc.dupe(u8, bin_dir);
-        std.mem.replaceScalar(u8, bin_w, '/', '\\');
-        const cmd = try std.fmt.allocPrint(alloc,
-            \\curl -fsSL https://github.com/astral-sh/uv/releases/latest/download/uv-{s}.zip -o "{s}\uv.zip" && tar -xf "{s}\uv.zip" -C "{s}" && del /q "{s}\uv.zip"
-        , .{ build_options.python_platform, bin_w, bin_w, bin_w, bin_w });
-        break :blk try alloc.dupe([]const u8, &.{ "cmd.exe", "/d", "/c", cmd });
-    } else blk: {
-        const cmd = try std.fmt.allocPrint(alloc,
-            \\set -e; curl -fsSL https://github.com/astral-sh/uv/releases/latest/download/uv-{s}.tar.gz | tar -xz -C '{s}' --strip-components=1
-        , .{ build_options.python_platform, bin_dir });
-        break :blk try alloc.dupe([]const u8, &.{ "sh", "-c", cmd });
-    };
-    const res = try std.process.Child.run(.{
+    // No shell: curl and tar run directly, sidestepping cmd.exe quoting.
+    // Both ship with Windows 10+ (tar is bsdtar there, which reads zip).
+    const url = try std.fmt.allocPrint(
+        alloc,
+        "https://github.com/astral-sh/uv/releases/latest/download/uv-{s}.{s}",
+        .{ build_options.python_platform, if (is_windows) "zip" else "tar.gz" },
+    );
+    const archive = try std.fmt.allocPrint(alloc, "{s}/uv-download.tmp", .{bin_dir});
+    try runQuiet(alloc, &.{ "curl", "-fsSL", url, "-o", archive });
+    if (is_windows) {
+        try runQuiet(alloc, &.{ "tar", "-xf", archive, "-C", bin_dir });
+    } else {
+        try runQuiet(alloc, &.{ "tar", "-xzf", archive, "-C", bin_dir, "--strip-components=1" });
+    }
+    std.fs.cwd().deleteFile(archive) catch {};
+    if (std.fs.cwd().access(cached, .{})) |_| return cached else |_| {
+        std.debug.print("taipan: uv download produced no {s}; install uv or set TAIPAN_UV.\n", .{cached});
+        std.process.exit(1);
+    }
+}
+
+fn runQuiet(alloc: std.mem.Allocator, argv: []const []const u8) !void {
+    const res = std.process.Child.run(.{
         .allocator = alloc,
         .argv = argv,
         .max_output_bytes = 1024 * 1024,
-    });
+    }) catch |err| {
+        std.debug.print("taipan: cannot run {s}: {s}; install uv or set TAIPAN_UV.\n", .{ argv[0], @errorName(err) });
+        std.process.exit(1);
+    };
     const ok = switch (res.term) {
         .Exited => |code| code == 0,
         else => false,
     };
     if (!ok) {
-        std.debug.print("taipan: could not download uv; install it or set TAIPAN_UV.\n{s}\n", .{res.stderr});
+        std.debug.print("taipan: {s} failed; install uv or set TAIPAN_UV.\n{s}\n", .{ argv[0], res.stderr });
         std.process.exit(1);
     }
-    return cached;
 }
 
 fn strLessThan(_: void, a: []const u8, b: []const u8) bool {

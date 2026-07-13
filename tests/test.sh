@@ -18,13 +18,14 @@ export TAIPAN_CACHE="$WORK/cache"
 pass=0
 fail=0
 
-check() { # name condition-exit-code
-    local name="$1" rc="$2"
+check() { # name condition-exit-code [output-to-show-on-failure]
+    local name="$1" rc="$2" out="${3:-}"
     if [ "$rc" -eq 0 ]; then
         echo "ok       $name"
         pass=$((pass + 1))
     else
         echo "FAIL     $name"
+        [ -n "$out" ] && printf '  output was:\n%s\n' "$out" | sed 's/^/  | /'
         fail=$((fail + 1))
     fi
 }
@@ -76,19 +77,20 @@ check "heavy stdlib imports from zipped stdlib" $?
 cold="$("$TAIPAN" run examples/pure_dep.py 2>&1)"
 echo "$cold" | grep -q "installing 1 dependencies" && \
     echo "$cold" | grep -q "taipan works with pure-python deps"
-check "PEP 723 cold: installs and runs" $?
+check "PEP 723 cold: installs and runs" $? "$cold"
 
 warm="$("$TAIPAN" run examples/pure_dep.py 2>&1)"
 echo "$warm" | grep -q "taipan works with pure-python deps" && \
     ! echo "$warm" | grep -q "installing"
-check "PEP 723 warm: cache hit, no uv" $?
+check "PEP 723 warm: cache hit, no uv" $? "$warm"
 
 env_dir=$(ls -d "$TAIPAN_CACHE"/envs/*/ | head -1)
 find "$env_dir" -name '*.pyc' | grep -q .
 check "dep env bytecode precompiled" $?
 
-"$TAIPAN" run examples/compiled_dep.py 2>&1 | grep -q "WITH C extension"
-check "compiled extension wheel loads" $?
+compiled="$("$TAIPAN" run examples/compiled_dep.py 2>&1)"
+echo "$compiled" | grep -q "WITH C extension"
+check "compiled extension wheel loads" $? "$compiled"
 
 # --- isolation: no python3/uv on PATH ------------------------------------------
 # POSIX-only: on Windows the msys tools can't be meaningfully symlinked into a
