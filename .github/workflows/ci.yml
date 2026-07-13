@@ -43,10 +43,30 @@ jobs:
           name: taipan-linux-x86_64
           path: zig-out/bin/taipan
 
-  release:
+  smoke-test:
     needs: build-and-test
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ["debian:bookworm-slim", "ubuntu:24.04", "fedora:latest"]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v5
+        with:
+          name: taipan-linux-x86_64
+          path: dist
+      - name: Smoke test artifact in ${{ matrix.image }}
+        run: |
+          chmod +x dist/taipan tests/smoke.sh
+          docker run --rm -v "$PWD:/w:ro" "${{ matrix.image }}" \
+            bash -c "install /w/dist/taipan /usr/local/bin/taipan && bash /w/tests/smoke.sh /usr/local/bin/taipan /w/examples"
+
+  release:
+    needs: [build-and-test, smoke-test]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
+    environment: release
     permissions:
       contents: write
     steps:
