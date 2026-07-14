@@ -18,15 +18,35 @@ runs go straight to the cached environment.
 
 ## Install
 
-Download the binary for your platform from the current release:
+On Linux or macOS, run:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/FarhanAliRaza/taipan/main/install.sh | sh
+```
+
+The script detects your platform, downloads the latest release, and installs
+it to `/usr/local/bin` (falling back to `~/.local/bin`). Set `TAIPAN_VERSION`
+to pin a release tag or `TAIPAN_INSTALL_DIR` to choose the install directory:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/FarhanAliRaza/taipan/main/install.sh | TAIPAN_INSTALL_DIR=~/bin sh
+```
+
+On Windows, download
+[taipan-windows-x86_64.exe](https://github.com/FarhanAliRaza/taipan/releases/latest/download/taipan-windows-x86_64.exe),
+rename it to `taipan.exe`, and place it somewhere on your `PATH`.
+
+### Manual download
+
+Binaries for every platform are attached to each release:
 
 | Platform | Download |
 | --- | --- |
-| Linux x86_64 | [taipan-linux-x86_64](https://github.com/FarhanAliRaza/taipan/releases/download/v0.2.0/taipan-linux-x86_64) |
-| Linux ARM64 | [taipan-linux-aarch64](https://github.com/FarhanAliRaza/taipan/releases/download/v0.2.0/taipan-linux-aarch64) |
-| macOS Apple Silicon | [taipan-macos-aarch64](https://github.com/FarhanAliRaza/taipan/releases/download/v0.2.0/taipan-macos-aarch64) |
-| macOS Intel | [taipan-macos-x86_64](https://github.com/FarhanAliRaza/taipan/releases/download/v0.2.0/taipan-macos-x86_64) |
-| Windows x86_64 | [taipan-windows-x86_64.exe](https://github.com/FarhanAliRaza/taipan/releases/download/v0.2.0/taipan-windows-x86_64.exe) |
+| Linux x86_64 | [taipan-linux-x86_64](https://github.com/FarhanAliRaza/taipan/releases/latest/download/taipan-linux-x86_64) |
+| Linux ARM64 | [taipan-linux-aarch64](https://github.com/FarhanAliRaza/taipan/releases/latest/download/taipan-linux-aarch64) |
+| macOS Apple Silicon | [taipan-macos-aarch64](https://github.com/FarhanAliRaza/taipan/releases/latest/download/taipan-macos-aarch64) |
+| macOS Intel | [taipan-macos-x86_64](https://github.com/FarhanAliRaza/taipan/releases/latest/download/taipan-macos-x86_64) |
+| Windows x86_64 | [taipan-windows-x86_64.exe](https://github.com/FarhanAliRaza/taipan/releases/latest/download/taipan-windows-x86_64.exe) |
 
 On Linux or macOS, rename the download and make it executable:
 
@@ -35,9 +55,6 @@ mv taipan-<platform> taipan
 chmod +x taipan
 sudo mv taipan /usr/local/bin/
 ```
-
-On Windows, rename the downloaded file to `taipan.exe` and place it somewhere
-on your `PATH`.
 
 You can also browse [all releases](https://github.com/FarhanAliRaza/taipan/releases).
 
