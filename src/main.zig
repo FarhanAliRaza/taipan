@@ -19,6 +19,8 @@ const RunFileFn = *const fn (
     extra_sys_path: [*:0]const u8,
     precompile_extra: c_int,
     script_path: [*:0]const u8,
+    script_source: [*:0]const u8,
+    pyc_path: [*:0]const u8,
     argc: c_int,
     argv: [*c][*c]u8,
 ) callconv(.c) c_int;
@@ -41,13 +43,27 @@ pub fn main() !void {
     }
     const script_path = args[script_idx];
 
-    const src = std.fs.cwd().readFileAlloc(alloc, script_path, 16 * 1024 * 1024) catch |err| {
+    var src: []u8 = std.fs.cwd().readFileAlloc(alloc, script_path, 16 * 1024 * 1024) catch |err| {
         std.debug.print("taipan: cannot read {s}: {s}\n", .{ script_path, @errorName(err) });
         std.process.exit(1);
+    };
+    // The shim compiles from a UTF-8 string, where a BOM (which CPython's
+    // file reader would skip) is a syntax error.
+    if (std.mem.startsWith(u8, src, "\xEF\xBB\xBF")) src = src[3..];
+
+    // Absolute path (with '/' separators) for __file__ and traceback
+    // filenames: it stays valid however the cwd changes, and it is part of
+    // the compiled-script cache key.
+    const abs_script = blk: {
+        const cwd = try std.process.getCwdAlloc(alloc);
+        const p = try std.fs.path.resolve(alloc, &.{ cwd, script_path });
+        if (is_windows) std.mem.replaceScalar(u8, p, '\\', '/');
+        break :blk p;
     };
 
     const cache_root = try cacheRoot(alloc);
     const rt = try ensureRuntime(alloc, cache_root);
+    const pyc_path = scriptPycPath(alloc, cache_root, abs_script, src);
 
     const deps = try pep723.parseDeps(alloc, src);
     var extra_path: []const u8 = "";
@@ -75,7 +91,9 @@ pub fn main() !void {
         (try alloc.dupeZ(u8, rt.stdlib_zip)).ptr,
         (try alloc.dupeZ(u8, extra_path)).ptr,
         @intFromBool(fresh_env),
-        (try alloc.dupeZ(u8, script_path)).ptr,
+        (try alloc.dupeZ(u8, abs_script)).ptr,
+        (try alloc.dupeZ(u8, src)).ptr,
+        (try alloc.dupeZ(u8, pyc_path)).ptr,
         @intCast(py_argc),
         argv_z.ptr,
     );
@@ -101,6 +119,26 @@ fn cacheRoot(alloc: std.mem.Allocator) ![]const u8 {
         return w;
     }
     return root;
+}
+
+/// Cache path for the script's compiled code object, so warm startup never
+/// pays source->bytecode cost. Keyed by runtime tag + absolute script path +
+/// source content: an edit or move changes the key, so entries cannot go
+/// stale. Returns "" (cache disabled) if the cache dir cannot be created.
+fn scriptPycPath(alloc: std.mem.Allocator, cache_root: []const u8, abs_script: []const u8, src: []const u8) []const u8 {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update(build_options.runtime_tag);
+    hasher.update("\x00");
+    hasher.update(abs_script);
+    hasher.update("\x00");
+    hasher.update(src);
+    var digest: [32]u8 = undefined;
+    hasher.final(&digest);
+    const hex = std.fmt.bytesToHex(digest, .lower);
+
+    const dir = std.fmt.allocPrint(alloc, "{s}/scripts", .{cache_root}) catch return "";
+    std.fs.cwd().makePath(dir) catch return "";
+    return std.fmt.allocPrint(alloc, "{s}/{s}.pyc", .{ dir, hex[0..16] }) catch "";
 }
 
 const Runtime = struct {
