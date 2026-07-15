@@ -101,6 +101,18 @@ jobs:
         with:
           name: taipan-windows-x86_64
           path: dist
+      # The docker service is not always up yet when the job starts.
+      - name: Wait for Docker engine
+        shell: pwsh
+        run: |
+          Start-Service docker -ErrorAction SilentlyContinue
+          for ($i = 0; $i -lt 24; $i++) {
+            docker info *> $null
+            if ($LASTEXITCODE -eq 0) { exit 0 }
+            Start-Sleep -Seconds 5
+          }
+          Write-Error "docker engine did not become ready"
+          exit 1
       # servercore is python-less but ships curl.exe/tar.exe; its version must
       # match the host (windows-latest = Server 2025, process isolation).
       - name: Smoke test artifact in servercore:ltsc2025
