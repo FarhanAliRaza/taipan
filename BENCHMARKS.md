@@ -187,3 +187,19 @@ runner). Re-measured warm: `taipan hello` = 9.7 ± 0.6 ms, `taipan run pure_dep`
 figure is the intrinsic cost of importing through zipimport rather than a
 directory tree — accepted for now; frozen bootstrap modules are the proper
 fix and are on the roadmap.
+
+### Frozen bootstrap modules + compiled-script cache
+
+Both roadmap fixes landed. The startup modules not already frozen inside
+libpython (the `encodings` family) are now frozen into the shim, so a warm
+start of a dependency-free script never opens stdlib.zip; and the script's
+compiled code object is cached under `scripts/` in the taipan cache (keyed
+by runtime + absolute path + content hash), so warm startup no longer pays
+source→bytecode compilation.
+
+Indicative numbers from a Linux x86_64 container (a different, noisier
+environment than the laptop used above — compare the columns, not the rows):
+mean of 25 warm runs, ReleaseFast build. `taipan hello`: 15.0 → 9.8 ms.
+A generated 270 KB script: 183 → 31 ms. The remaining time on the large
+script is unmarshalling and executing its own bytecode, which any Python
+runtime pays in proportion to code size.

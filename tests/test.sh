@@ -73,6 +73,46 @@ EOF
 "$TAIPAN" "$WORK/stdlib.py" 2>&1 | grep -q "stdlib-ok"
 check "heavy stdlib imports from zipped stdlib" $?
 
+# --- compiled-script cache ----------------------------------------------------
+echo 'print("cached-run")' > "$WORK/cached.py"
+"$TAIPAN" "$WORK/cached.py" >/dev/null 2>&1 && \
+    find "$TAIPAN_CACHE/scripts" -name '*.pyc' | grep -q .
+check "script bytecode cached under scripts/" $?
+
+out="$("$TAIPAN" "$WORK/cached.py" 2>&1)"
+[ "$out" = "cached-run" ]
+check "warm run served from script cache" $? "$out"
+
+echo 'print("cached-edited")' > "$WORK/cached.py"
+out="$("$TAIPAN" "$WORK/cached.py" 2>&1)"
+[ "$out" = "cached-edited" ]
+check "edited script recompiled (content-hash key)" $? "$out"
+
+printf 'x = 1\nraise RuntimeError("boom")\n' > "$WORK/tb.py"
+"$TAIPAN" "$WORK/tb.py" 2>/dev/null                # cold: populate the cache
+out="$("$TAIPAN" "$WORK/tb.py" 2>&1)"              # warm: from cached bytecode
+echo "$out" | grep -q 'line 2' && echo "$out" | grep -qF 'raise RuntimeError("boom")'
+check "warm traceback keeps file/line and source text" $? "$out"
+
+printf '\xef\xbb\xbfprint("bom-ok")\n' > "$WORK/bom.py"
+"$TAIPAN" "$WORK/bom.py" 2>&1 | grep -q "bom-ok"
+check "script with UTF-8 BOM runs" $?
+
+# --- frozen startup modules -----------------------------------------------------
+cat > "$WORK/frozen.py" <<'EOF'
+import sys
+encs = {n: m.__spec__.origin for n, m in sys.modules.items()
+        if n.startswith("encodings")}
+if encs and all(o == "frozen" for o in encs.values()):
+    print("frozen-ok")
+"cp850 codec loads from the zip:".encode("cp850")
+import encodings.idna
+print("zip-codecs-ok")
+EOF
+out="$("$TAIPAN" "$WORK/frozen.py" 2>&1)"
+echo "$out" | grep -q "frozen-ok" && echo "$out" | grep -q "zip-codecs-ok"
+check "startup encodings frozen; other codecs from zip" $? "$out"
+
 # --- PEP 723 dependencies -----------------------------------------------------
 cold="$("$TAIPAN" run examples/pure_dep.py 2>&1)"
 echo "$cold" | grep -q "installing 1 dependencies" && \

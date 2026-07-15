@@ -91,6 +91,13 @@ cache key from the runtime and sorted dependency list. A cache hit starts the
 script immediately. On a miss, taipan asks `uv` to install the packages into a
 new isolated cache directory before running the script.
 
+The script itself is compiled only once: the resulting bytecode is cached,
+keyed by the runtime, the script path, and a hash of its content, so warm
+startup does not depend on script size. Editing or moving the script changes
+the key and triggers a fresh compile. The modules Python touches on every
+startup are frozen directly into the runtime, so a warm start of a
+dependency-free script never has to read the bundled standard library at all.
+
 Compiled extension modules are supported. The bundled runtime is loaded in a
 way that allows extension wheels to resolve Python symbols just as they would
 with a conventional Python installation.
@@ -122,8 +129,6 @@ toolchain script.
 
 ## Roadmap
 
-- Cache compiled scripts so warm startup does not depend on script size.
-- Freeze bootstrap modules to reduce startup time further.
 - Add `taipan build` for bundling a script and its dependencies into one file.
 - Add Windows ARM64 support.
 

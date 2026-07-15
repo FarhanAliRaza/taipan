@@ -21,6 +21,18 @@ pub fn build(b: *std.Build) void {
         if (is_windows) "taipan_shim.dll" else if (is_macos) "libtaipan_shim.dylib" else "libtaipan_shim.so";
     const py_exe = if (is_windows) "vendor/cpython/python.exe" else "vendor/cpython/bin/python3";
 
+    // stdlib.zip (bytecode-only stdlib) + extra.tar (Windows .pyd extensions
+    // and support DLLs; empty elsewhere) + frozen.c (startup modules frozen
+    // into the shim). The script is passed via addFileArg so its content is
+    // a tracked input.
+    const payload = b.addSystemCommand(&.{b.pathFromRoot(py_exe)});
+    payload.addFileArg(b.path("tools/make_payload.py"));
+    payload.addArg(b.pathFromRoot("vendor/cpython"));
+    payload.addArg(if (is_windows) "windows" else "posix");
+    const stdlib_zip = payload.addOutputFileArg("stdlib.zip");
+    const extra_tar = payload.addOutputFileArg("extra.tar");
+    const frozen_c = payload.addOutputFileArg("taipan_frozen.c");
+
     // The C shim (all Python.h usage) as a shared library. It is embedded in
     // the exe, extracted to the runtime cache next to libpython, and loaded
     // at runtime — rpath $ORIGIN/@loader_path resolves libpython from the
@@ -32,6 +44,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     shim_mod.addCSourceFile(.{ .file = b.path("src/embed.c"), .flags = &.{"-std=c11"} });
+    shim_mod.addCSourceFile(.{ .file = frozen_c, .flags = &.{"-std=c11"} });
     shim_mod.addIncludePath(b.path(if (is_windows) "vendor/cpython/include" else "vendor/cpython/include/python3.13"));
     shim_mod.addIncludePath(b.path("src"));
     if (is_windows) {
@@ -46,16 +59,6 @@ pub fn build(b: *std.Build) void {
         .linkage = .dynamic,
         .root_module = shim_mod,
     });
-
-    // stdlib.zip (bytecode-only stdlib) + extra.tar (Windows .pyd extensions
-    // and support DLLs; empty elsewhere). The script is passed via addFileArg
-    // so its content is a tracked input.
-    const payload = b.addSystemCommand(&.{b.pathFromRoot(py_exe)});
-    payload.addFileArg(b.path("tools/make_payload.py"));
-    payload.addArg(b.pathFromRoot("vendor/cpython"));
-    payload.addArg(if (is_windows) "windows" else "posix");
-    const stdlib_zip = payload.addOutputFileArg("stdlib.zip");
-    const extra_tar = payload.addOutputFileArg("extra.tar");
 
     // On Linux, python-build-standalone ships libpython unstripped (241MB of
     // debug info); strip to ~20MB before embedding. .dynsym survives
