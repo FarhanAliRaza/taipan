@@ -132,6 +132,52 @@ compiled="$("$TAIPAN" run examples/compiled_dep.py 2>&1)"
 echo "$compiled" | grep -q "WITH C extension"
 check "compiled extension wheel loads" $? "$compiled"
 
+# --- standalone builds -------------------------------------------------------
+"$TAIPAN" build examples/hello.py -o "$WORK/hello-built" >/dev/null 2>&1 && \
+    test -x "$WORK/hello-built"
+check "build creates an executable" $?
+
+mkdir "$WORK/shipped"
+mv "$WORK/hello-built" "$WORK/shipped/hello"
+out="$(cd "$WORK/shipped" && TAIPAN_CACHE="$WORK/bundle-cache" ./hello x 2>&1)"
+echo "$out" | grep -q "hello from taipan" && echo "$out" | grep -q "'x'"
+check "built executable runs without its source" $? "$out"
+
+"$TAIPAN" build examples/pure_dep.py -o "$WORK/shipped/pure-dep" >/dev/null 2>&1
+out="$(cd "$WORK/shipped" && \
+    TAIPAN_CACHE="$WORK/bundle-dep-cache" TAIPAN_UV=/definitely/missing ./pure-dep 2>&1)"
+echo "$out" | grep -q "taipan works with pure-python deps" && \
+    test -f "$WORK"/bundle-dep-cache/bundles/*/.taipan-ok
+check "built executable carries PEP 723 dependencies" $? "$out"
+
+# --- threads and multiprocessing --------------------------------------------
+cat > "$WORK/concurrency.py" <<'EOF'
+import concurrent.futures
+import multiprocessing as mp
+import sys
+
+def square(x):
+    return x * x
+
+if __name__ == "__main__":
+    with concurrent.futures.ThreadPoolExecutor(2) as pool:
+        assert list(pool.map(square, range(4))) == [0, 1, 4, 9]
+    with mp.get_context("spawn").Pool(2) as pool:
+        assert pool.map(square, range(4)) == [0, 1, 4, 9]
+    assert sys.executable
+    print("concurrency-ok")
+EOF
+out="$("$TAIPAN" run "$WORK/concurrency.py" 2>&1)"
+echo "$out" | grep -q "concurrency-ok"
+check "run supports threads and spawned processes" $? "$out"
+
+"$TAIPAN" build "$WORK/concurrency.py" -o "$WORK/shipped/concurrency" >/dev/null 2>&1
+rm "$WORK/concurrency.py"
+out="$(TAIPAN_CACHE="$WORK/bundle-concurrency-cache" \
+    "$WORK/shipped/concurrency" 2>&1)"
+echo "$out" | grep -q "concurrency-ok"
+check "built executable supports spawned processes" $? "$out"
+
 # --- isolation: no python3/uv on PATH ------------------------------------------
 # POSIX-only: on Windows the msys tools can't be meaningfully symlinked into a
 # bare PATH (they need their own DLLs), and env -i breaks Win32 API basics.

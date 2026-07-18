@@ -49,6 +49,35 @@ Set-Content -Path "$env:TEMP\smoke_boom.py" -Value "raise ValueError('boom')"
 $out = & $Bin "$env:TEMP\smoke_boom.py" 2>&1 | Out-String
 Check traceback 1 $LASTEXITCODE $out "ValueError: boom"
 
+# Build inside the container, delete the input scripts, and run with a fresh
+# cache plus an invalid uv path. A passing run therefore came entirely from
+# the standalone executable.
+$work = Join-Path $env:TEMP ("taipan-smoke-" + [guid]::NewGuid().ToString("N"))
+New-Item -ItemType Directory -Path $work | Out-Null
+Copy-Item "$Examples\hello.py" "$work\hello.py"
+Copy-Item "$Examples\compiled_dep.py" "$work\compiled_dep.py"
+Set-Content -Path "$work\exit7.py" -Value "import sys; sys.exit(7)"
+
+$env:TAIPAN_CACHE = "$work\build-cache"
+$out = & $Bin build "$work\hello.py" -o "$work\hello-built.exe" 2>&1 | Out-String
+Check build-hello 0 $LASTEXITCODE $out "built"
+$out = & $Bin build "$work\compiled_dep.py" -o "$work\compiled-built.exe" 2>&1 | Out-String
+Check build-compiled-dep 0 $LASTEXITCODE $out "built"
+$out = & $Bin build "$work\exit7.py" -o "$work\exit7-built.exe" 2>&1 | Out-String
+Check build-exit-code 0 $LASTEXITCODE $out "built"
+
+Remove-Item "$work\hello.py", "$work\compiled_dep.py", "$work\exit7.py"
+$env:TAIPAN_CACHE = "$work\run-cache"
+$env:TAIPAN_UV = "$work\missing-uv.exe"
+$out = & "$work\hello-built.exe" docker-arg 2>&1 | Out-String
+Check built-hello 0 $LASTEXITCODE $out "docker-arg"
+$out = & "$work\compiled-built.exe" 2>&1 | Out-String
+Check built-compiled-dep 0 $LASTEXITCODE $out "WITH C extension"
+& "$work\exit7-built.exe" 2>&1 | Out-Null
+Check built-exit-code 7 $LASTEXITCODE "" ""
+
+Remove-Item -Recurse -Force $work
+
 if ($script:fail -eq 0) { Write-Host "SMOKE OK"; exit 0 }
 Write-Host "SMOKE FAILED"
 exit 1

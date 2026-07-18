@@ -15,6 +15,7 @@ const shim_so = @embedFile("shim_so");
 const extra_tar = @embedFile("extra_tar");
 
 const RunFileFn = *const fn (
+    executable_path: [*:0]const u8,
     stdlib_path: [*:0]const u8,
     extra_sys_path: [*:0]const u8,
     precompile_extra: c_int,
@@ -25,7 +26,21 @@ const RunFileFn = *const fn (
     argv: [*c][*c]u8,
 ) callconv(.c) c_int;
 
-const usage = "usage: taipan run <script.py> [args...]\n";
+const usage =
+    \\usage:
+    \\  taipan <script.py> [args...]
+    \\  taipan run <script.py> [args...]
+    \\  taipan build <script.py> [-o <output>]
+    \\
+;
+
+const bundle_magic = "TPNBNDL1";
+const bundle_footer_len = bundle_magic.len + 3 * @sizeOf(u64);
+
+const Bundle = struct {
+    source: []u8,
+    deps_tar: []u8,
+};
 
 pub fn main() !void {
     var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
@@ -33,6 +48,29 @@ pub fn main() !void {
     const alloc = arena_state.allocator();
 
     const args = try std.process.argsAlloc(alloc);
+
+    // CPython's multiprocessing helpers re-exec sys.executable with `-c` for
+    // the resource tracker, fork server, and spawned workers. This mode is
+    // deliberately enabled only in descendants of an active taipan runtime,
+    // so `-c` remains an ordinary argument to a built application.
+    if (std.process.hasEnvVarConstant("TAIPAN_CHILD")) {
+        for (args[1..], 1..) |arg, i| {
+            if (std.mem.eql(u8, arg, "-c") and i + 1 < args.len) try runCommand(alloc, args, i);
+        }
+    }
+
+    // A built executable is the normal taipan launcher with a script and its
+    // dependency environment appended. It always runs that embedded script;
+    // every command-line argument belongs to the script.
+    if (try readBundle(alloc)) |bundle| {
+        const self_path = try std.fs.selfExePathAlloc(alloc);
+        try runScript(alloc, args, 0, self_path, bundle.source, bundle.deps_tar);
+    }
+
+    if (args.len >= 2 and std.mem.eql(u8, args[1], "build")) {
+        try buildCommand(alloc, args);
+        return;
+    }
 
     // Accept both `taipan run script.py` and `taipan script.py`.
     var script_idx: usize = 1;
@@ -51,28 +89,46 @@ pub fn main() !void {
     // file reader would skip) is a syntax error.
     if (std.mem.startsWith(u8, src, "\xEF\xBB\xBF")) src = src[3..];
 
+    try runScript(alloc, args, script_idx, script_path, src, null);
+}
+
+fn runScript(
+    alloc: std.mem.Allocator,
+    args: []const []const u8,
+    script_idx: usize,
+    script_path: []const u8,
+    src: []u8,
+    bundled_deps: ?[]const u8,
+) !noreturn {
+    const cache_root = try cacheRoot(alloc);
+    var effective_script = script_path;
+    var extra_path: []const u8 = "";
+    var fresh_env = false;
+    if (bundled_deps) |archive| {
+        const bundle = try ensureBundle(alloc, cache_root, src, archive);
+        effective_script = bundle.script;
+        if (archive.len > 0) extra_path = bundle.dir;
+    } else {
+        const deps = try pep723.parseDeps(alloc, src);
+        if (deps.len > 0) {
+            const env = try ensureEnv(alloc, cache_root, deps);
+            extra_path = env.dir;
+            fresh_env = env.fresh;
+        }
+    }
+
     // Absolute path (with '/' separators) for __file__ and traceback
     // filenames: it stays valid however the cwd changes, and it is part of
     // the compiled-script cache key.
     const abs_script = blk: {
         const cwd = try std.process.getCwdAlloc(alloc);
-        const p = try std.fs.path.resolve(alloc, &.{ cwd, script_path });
+        const p = try std.fs.path.resolve(alloc, &.{ cwd, effective_script });
         if (is_windows) std.mem.replaceScalar(u8, p, '\\', '/');
         break :blk p;
     };
 
-    const cache_root = try cacheRoot(alloc);
     const rt = try ensureRuntime(alloc, cache_root);
     const pyc_path = scriptPycPath(alloc, cache_root, abs_script, src);
-
-    const deps = try pep723.parseDeps(alloc, src);
-    var extra_path: []const u8 = "";
-    var fresh_env = false;
-    if (deps.len > 0) {
-        const env = try ensureEnv(alloc, cache_root, deps);
-        extra_path = env.dir;
-        fresh_env = env.fresh;
-    }
 
     // sys.argv = [script, script args...]
     const py_argc = args.len - script_idx;
@@ -86,8 +142,10 @@ pub fn main() !void {
     // symbols; then the shim, whose rpath ($ORIGIN / @loader_path) also
     // points at the runtime dir.
     const run_file = loadShim(alloc, rt);
+    const self_path = try std.fs.selfExePathAlloc(alloc);
 
     const rc = run_file(
+        (try alloc.dupeZ(u8, self_path)).ptr,
         (try alloc.dupeZ(u8, rt.stdlib_zip)).ptr,
         (try alloc.dupeZ(u8, extra_path)).ptr,
         @intFromBool(fresh_env),
@@ -98,6 +156,225 @@ pub fn main() !void {
         argv_z.ptr,
     );
     std.process.exit(if (rc < 0) 1 else @intCast(@min(rc, 255)));
+}
+
+fn runCommand(alloc: std.mem.Allocator, args: []const []const u8, command_idx: usize) !noreturn {
+    const cache_root = try cacheRoot(alloc);
+    const rt = try ensureRuntime(alloc, cache_root);
+    const extra_path = std.process.getEnvVarOwned(alloc, "TAIPAN_CHILD_PATH") catch "";
+
+    // Python's `-c` argv excludes the command string itself.
+    const py_argc = args.len - command_idx - 1;
+    const argv_z = try alloc.alloc([*c]u8, py_argc);
+    argv_z[0] = (try alloc.dupeZ(u8, "-c")).ptr;
+    for (args[command_idx + 2 ..], 1..) |arg, i| argv_z[i] = (try alloc.dupeZ(u8, arg)).ptr;
+
+    const self_path = try std.fs.selfExePathAlloc(alloc);
+    const run_file = loadShim(alloc, rt);
+    const rc = run_file(
+        (try alloc.dupeZ(u8, self_path)).ptr,
+        (try alloc.dupeZ(u8, rt.stdlib_zip)).ptr,
+        (try alloc.dupeZ(u8, extra_path)).ptr,
+        0,
+        "<string>",
+        (try alloc.dupeZ(u8, args[command_idx + 1])).ptr,
+        "",
+        @intCast(py_argc),
+        argv_z.ptr,
+    );
+    std.process.exit(if (rc < 0) 1 else @intCast(@min(rc, 255)));
+}
+
+fn buildCommand(alloc: std.mem.Allocator, args: []const []const u8) !void {
+    if (args.len < 3) {
+        std.debug.print(usage, .{});
+        std.process.exit(2);
+    }
+
+    const script_path = args[2];
+    var output: ?[]const u8 = null;
+    var i: usize = 3;
+    while (i < args.len) {
+        if ((std.mem.eql(u8, args[i], "-o") or std.mem.eql(u8, args[i], "--output")) and i + 1 < args.len) {
+            if (output != null) {
+                std.debug.print("taipan: output specified more than once\n", .{});
+                std.process.exit(2);
+            }
+            output = args[i + 1];
+            i += 2;
+        } else {
+            std.debug.print("taipan: unknown build option: {s}\n", .{args[i]});
+            std.process.exit(2);
+        }
+    }
+    const output_path = output orelse blk: {
+        const stem = std.fs.path.stem(std.fs.path.basename(script_path));
+        break :blk if (is_windows)
+            try std.fmt.allocPrint(alloc, "{s}.exe", .{stem})
+        else
+            try alloc.dupe(u8, stem);
+    };
+
+    var src = std.fs.cwd().readFileAlloc(alloc, script_path, 16 * 1024 * 1024) catch |err| {
+        std.debug.print("taipan: cannot read {s}: {s}\n", .{ script_path, @errorName(err) });
+        std.process.exit(1);
+    };
+    if (std.mem.startsWith(u8, src, "\xEF\xBB\xBF")) src = src[3..];
+
+    const cwd = try std.process.getCwdAlloc(alloc);
+    const abs_output = try std.fs.path.resolve(alloc, &.{ cwd, output_path });
+    const abs_script = try std.fs.path.resolve(alloc, &.{ cwd, script_path });
+    const self_path = try std.fs.selfExePathAlloc(alloc);
+    if (std.mem.eql(u8, abs_output, self_path) or std.mem.eql(u8, abs_output, abs_script)) {
+        std.debug.print("taipan: refusing to overwrite the launcher or input script\n", .{});
+        std.process.exit(1);
+    }
+
+    const cache_root = try cacheRoot(alloc);
+    const deps = try pep723.parseDeps(alloc, src);
+    var env_dir: ?[]const u8 = null;
+    if (deps.len > 0) {
+        const env = try ensureEnv(alloc, cache_root, deps);
+        env_dir = env.dir;
+    }
+
+    const pid = if (is_windows) std.os.windows.GetCurrentProcessId() else std.c.getpid();
+    const tmp_path = try std.fmt.allocPrint(alloc, "{s}.tmp.{d}", .{ abs_output, pid });
+    errdefer std.fs.deleteFileAbsolute(tmp_path) catch {};
+
+    var launcher = try std.fs.openFileAbsolute(self_path, .{});
+    defer launcher.close();
+    const launcher_stat = try launcher.stat();
+    {
+        var output_file = try std.fs.createFileAbsolute(tmp_path, .{ .read = true, .mode = 0o755 });
+        defer output_file.close();
+
+        var write_buf: [64 * 1024]u8 = undefined;
+        var out_writer = output_file.writerStreaming(&write_buf);
+        var read_buf: [64 * 1024]u8 = undefined;
+        var launcher_reader = std.fs.File.Reader.initSize(launcher, &read_buf, launcher_stat.size);
+        _ = try out_writer.interface.sendFileAll(&launcher_reader, .unlimited);
+        try out_writer.interface.writeAll(src);
+
+        const deps_start = launcher_stat.size + src.len;
+        if (env_dir) |dir| try writeDirectoryTar(alloc, dir, &out_writer.interface);
+        try out_writer.interface.flush();
+        const payload_end = try output_file.getPos();
+        const deps_len = payload_end - deps_start;
+
+        var footer: [bundle_footer_len]u8 = undefined;
+        @memcpy(footer[0..bundle_magic.len], bundle_magic);
+        std.mem.writeInt(u64, footer[8..16], launcher_stat.size, .little);
+        std.mem.writeInt(u64, footer[16..24], src.len, .little);
+        std.mem.writeInt(u64, footer[24..32], deps_len, .little);
+        try out_writer.interface.writeAll(&footer);
+        try out_writer.end();
+    }
+
+    // Only replace an older output after the temporary executable is complete.
+    std.fs.deleteFileAbsolute(abs_output) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
+    try std.fs.renameAbsolute(tmp_path, abs_output);
+    if (!is_windows) {
+        var built = try std.fs.openFileAbsolute(abs_output, .{ .mode = .read_write });
+        defer built.close();
+        try built.chmod(0o755);
+    }
+    std.debug.print("taipan: built {s} ({d} dependencies)\n", .{ output_path, deps.len });
+}
+
+fn writeDirectoryTar(alloc: std.mem.Allocator, path: []const u8, writer: *std.Io.Writer) !void {
+    var root = try std.fs.cwd().openDir(path, .{ .iterate = true });
+    defer root.close();
+    var walker = try root.walk(alloc);
+    defer walker.deinit();
+    var archive: std.tar.Writer = .{ .underlying_writer = writer };
+
+    while (try walker.next()) |entry| {
+        // This is the source environment's completion marker. The bundle has
+        // its own marker which must only be written after extraction finishes.
+        if (std.mem.eql(u8, entry.path, ".taipan-ok")) continue;
+        const tar_path = try alloc.dupe(u8, entry.path);
+        defer alloc.free(tar_path);
+        if (is_windows) std.mem.replaceScalar(u8, tar_path, '\\', '/');
+        switch (entry.kind) {
+            .directory => try archive.writeDir(tar_path, .{}),
+            .file => {
+                var file = try entry.dir.openFile(entry.basename, .{});
+                defer file.close();
+                const stat = try file.stat();
+                var buf: [64 * 1024]u8 = undefined;
+                var reader = std.fs.File.Reader.initSize(file, &buf, stat.size);
+                try archive.writeFile(tar_path, &reader, stat.mtime);
+            },
+            .sym_link => {
+                var target_buf: [4096]u8 = undefined;
+                const target = try entry.dir.readLink(entry.basename, &target_buf);
+                try archive.writeLink(tar_path, target, .{});
+            },
+            else => return error.UnsupportedDependencyFileType,
+        }
+    }
+}
+
+fn readBundle(alloc: std.mem.Allocator) !?Bundle {
+    const self_path = try std.fs.selfExePathAlloc(alloc);
+    var file = try std.fs.openFileAbsolute(self_path, .{});
+    defer file.close();
+    const size = (try file.stat()).size;
+    if (size < bundle_footer_len) return null;
+
+    var footer: [bundle_footer_len]u8 = undefined;
+    try file.seekTo(size - bundle_footer_len);
+    if (try file.readAll(&footer) != footer.len) return null;
+    if (!std.mem.eql(u8, footer[0..8], bundle_magic)) return null;
+    const base_len = std.mem.readInt(u64, footer[8..16], .little);
+    const source_len = std.mem.readInt(u64, footer[16..24], .little);
+    const deps_len = std.mem.readInt(u64, footer[24..32], .little);
+    const expected = std.math.add(u64, base_len, source_len) catch return error.InvalidBundle;
+    const expected_payload = std.math.add(u64, expected, deps_len) catch return error.InvalidBundle;
+    const expected_size = std.math.add(u64, expected_payload, bundle_footer_len) catch return error.InvalidBundle;
+    if (expected_size != size or source_len > 16 * 1024 * 1024) return error.InvalidBundle;
+
+    const source = try alloc.alloc(u8, @intCast(source_len));
+    const deps_tar = try alloc.alloc(u8, @intCast(deps_len));
+    try file.seekTo(base_len);
+    if (try file.readAll(source) != source.len or try file.readAll(deps_tar) != deps_tar.len)
+        return error.InvalidBundle;
+    return .{ .source = source, .deps_tar = deps_tar };
+}
+
+const BundlePaths = struct { dir: []const u8, script: []const u8 };
+
+fn ensureBundle(alloc: std.mem.Allocator, cache_root: []const u8, src: []const u8, archive: []const u8) !BundlePaths {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update(build_options.runtime_tag);
+    hasher.update(src);
+    hasher.update(archive);
+    var digest: [32]u8 = undefined;
+    hasher.final(&digest);
+    const hex = std.fmt.bytesToHex(digest, .lower);
+    const dir = try std.fmt.allocPrint(alloc, "{s}/bundles/{s}", .{ cache_root, hex[0..16] });
+    const marker = try std.fmt.allocPrint(alloc, "{s}/.taipan-ok", .{dir});
+    const script = try std.fmt.allocPrint(alloc, "{s}/.taipan-main.py", .{dir});
+    if (std.fs.cwd().access(marker, .{})) |_| return .{ .dir = dir, .script = script } else |_| {}
+
+    std.fs.cwd().deleteTree(dir) catch {};
+    try std.fs.cwd().makePath(dir);
+    if (archive.len > 0) {
+        var dest = try std.fs.cwd().openDir(dir, .{});
+        defer dest.close();
+        try tarx.extract(dest, archive);
+    }
+    {
+        var file = try std.fs.cwd().createFile(script, .{});
+        defer file.close();
+        try file.writeAll(src);
+    }
+    (try std.fs.cwd().createFile(marker, .{})).close();
+    return .{ .dir = dir, .script = script };
 }
 
 /// Cache root, always with '/' separators — they work in every Windows API

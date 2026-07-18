@@ -73,6 +73,25 @@ The explicit `run` command works too:
 taipan run script.py [args...]
 ```
 
+### Build a standalone executable
+
+Bundle a script, CPython, and its PEP 723 dependencies into one executable:
+
+```sh
+taipan build app.py -o app
+./app [args...]
+```
+
+The output name defaults to the script name without `.py` (with `.exe` added
+on Windows). The built file can be copied to another machine of the same
+platform and run without the source script, Python, uv, or network access.
+Dependencies are resolved while building, so the build machine does need
+network access on the first build of a dependency set.
+
+Builds are platform-specific. Build on each operating system and CPU
+architecture you intend to distribute to; packages containing native extension
+modules must match that target as well.
+
 For a script with inline dependencies:
 
 ```python
@@ -120,6 +139,16 @@ Compiled extension modules are supported. The bundled runtime is loaded in a
 way that allows extension wheels to resolve Python symbols just as they would
 with a conventional Python installation.
 
+Threads and all platform start methods from `multiprocessing` are supported.
+Spawned workers re-enter the embedded interpreter through `sys.executable` and
+inherit the script's dependency environment.
+
+`taipan build` appends the script and its installed dependency environment to
+a copy of the launcher. On first launch, the executable extracts its runtime
+and dependencies into a content-addressed cache, then runs the embedded script
+directly. Later launches reuse those files. The shipped artifact itself remains
+a single file.
+
 The cache lives at `~/.cache/taipan` by default. Set `TAIPAN_CACHE` to move it,
 or `TAIPAN_UV` to use a specific `uv` executable.
 
@@ -147,7 +176,6 @@ toolchain script.
 
 ## Roadmap
 
-- Add `taipan build` for bundling a script and its dependencies into one file.
 - Add Windows ARM64 support.
 
 ## Limitations
@@ -158,9 +186,9 @@ toolchain script.
   identify standard-library files and line numbers, but cannot display their
   source lines. Code that expects those modules to exist as ordinary files may
   also fail. `tkinter`, `idlelib`, `venv`, and `ensurepip` are not included.
-- `sys.executable` is not a conventional Python interpreter and may be empty.
-  Python subprocesses and `multiprocessing` with the `spawn` start method may
-  not work as expected.
+- `sys.executable` points to the taipan launcher. Invoking it with a script or
+  with Python's internal `-c` worker protocol is supported, but it is not a
+  complete replacement for every CPython command-line option.
 - PEP 723 parsing intentionally supports only the dependency syntax taipan
   needs. `requires-python` is not currently enforced.
 - Dependency sets are not locked. The first installation uses whatever
@@ -170,3 +198,6 @@ toolchain script.
   certificate store.
 - The first run extracts the bundled runtime into the local cache and therefore
   uses additional disk space.
+- Standalone builds bundle one PEP 723 script and its declared dependencies;
+  they do not yet discover and include adjacent local modules or package an
+  entire `pyproject.toml` project.

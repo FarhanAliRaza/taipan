@@ -121,7 +121,8 @@ static int exec_module_code(PyObject *code, const char *script_path) {
     return 0;
 }
 
-int taipan_run_file(const char *stdlib_path, const char *extra_sys_path,
+int taipan_run_file(const char *executable_path, const char *stdlib_path,
+                 const char *extra_sys_path,
                  int precompile_extra, const char *script_path,
                  const char *script_source, const char *pyc_path,
                  int argc, char **argv) {
@@ -141,6 +142,20 @@ int taipan_run_file(const char *stdlib_path, const char *extra_sys_path,
 
     status = PyConfig_SetBytesString(&config, &config.program_name, "taipan");
     if (PyStatus_Exception(status)) goto fail;
+    status = PyConfig_SetBytesString(&config, &config.executable,
+                                     executable_path);
+    if (PyStatus_Exception(status)) goto fail;
+
+    /* multiprocessing re-execs sys.executable for trackers and spawned
+     * workers. Mark descendants so the launcher recognizes that private -c
+     * protocol, and carry the dependency path across the exec boundary. */
+#ifdef MS_WINDOWS
+    _putenv_s("TAIPAN_CHILD", "1");
+    _putenv_s("TAIPAN_CHILD_PATH", extra_sys_path ? extra_sys_path : "");
+#else
+    setenv("TAIPAN_CHILD", "1", 1);
+    setenv("TAIPAN_CHILD_PATH", extra_sys_path ? extra_sys_path : "", 1);
+#endif
 
     /* No config.home, no path probing: sys.path is exactly what we say. */
     config.module_search_paths_set = 1;
