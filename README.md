@@ -171,6 +171,35 @@ Warm startup is close to launching a bare Python interpreter and avoids the
 repeated environment checks made by `uv run`. See [BENCHMARKS.md](./BENCHMARKS.md)
 for the test setup, raw results, and caveats.
 
+## Comparison with `uv run`
+
+`uv run` covers much of the same ground: it runs PEP 723 scripts and can
+download a Python interpreter on first use. taipan itself uses `uv` to install
+dependencies. If you have uv set up and network access, `uv run` is a good way
+to run scripts.
+
+The differences are in what has to happen before and between runs:
+
+- **The interpreter is inside the binary.** uv downloads CPython from the
+  network the first time it needs one. taipan is one file that already
+  contains it, so standard-library scripts run on machines with no network
+  access and nothing preinstalled. Scripts with dependencies still need
+  network once, for the first install.
+- **Warm starts do less.** `uv run` revalidates the environment on every
+  invocation; taipan's warm path is a cache check. On the benchmark machine
+  that is roughly 10 ms versus 30 ms per run, which adds up in git hooks,
+  editor integrations, and scripts invoked in a loop.
+- **Deployment is one file copy.** Handing a script to a machine, container,
+  or colleague means copying `taipan` next to it. There is no bootstrap step
+  that itself needs a working network and package host.
+- **Scripts can become standalone executables.** `taipan build app.py`
+  produces a single file containing the launcher, the script, and its
+  installed dependencies. It runs on a matching platform with no Python, uv,
+  or network access. uv has no equivalent.
+
+taipan is not a project manager. For lockfiles, multiple Python versions,
+tool installs, or anything with a `pyproject.toml`, use uv.
+
 ## Building from source
 
 Builds are native because the bundled CPython runtime must match the host

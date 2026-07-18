@@ -62,7 +62,14 @@ pub fn main() !void {
     // A built executable is the normal taipan launcher with a script and its
     // dependency environment appended. It always runs that embedded script;
     // every command-line argument belongs to the script.
-    if (try readBundle(alloc)) |bundle| {
+    const maybe_bundle = readBundle(alloc) catch |err| switch (err) {
+        error.InvalidBundle => {
+            std.debug.print("taipan: this executable is corrupt (truncated or modified after `taipan build`)\n", .{});
+            std.process.exit(1);
+        },
+        else => return err,
+    };
+    if (maybe_bundle) |bundle| {
         const self_path = try std.fs.selfExePathAlloc(alloc);
         try runScript(alloc, args, 0, self_path, bundle.source, bundle.deps_tar);
     }
@@ -107,7 +114,10 @@ fn runScript(
     if (bundled_deps) |archive| {
         const bundle = try ensureBundle(alloc, cache_root, src, archive);
         effective_script = bundle.script;
-        if (archive.len > 0) extra_path = bundle.dir;
+        if (archive.len > 0) {
+            extra_path = bundle.dir;
+            fresh_env = bundle.fresh;
+        }
     } else {
         const deps = try pep723.parseDeps(alloc, src);
         if (deps.len > 0) {
@@ -197,7 +207,11 @@ fn buildCommand(alloc: std.mem.Allocator, args: []const []const u8) !void {
     var includes: std.ArrayList([]const u8) = .empty;
     var i: usize = 3;
     while (i < args.len) {
-        if ((std.mem.eql(u8, args[i], "-o") or std.mem.eql(u8, args[i], "--output")) and i + 1 < args.len) {
+        if (std.mem.eql(u8, args[i], "-o") or std.mem.eql(u8, args[i], "--output")) {
+            if (i + 1 >= args.len) {
+                std.debug.print("taipan: missing value for {s}\n", .{args[i]});
+                std.process.exit(2);
+            }
             if (output != null) {
                 std.debug.print("taipan: output specified more than once\n", .{});
                 std.process.exit(2);
@@ -430,7 +444,10 @@ fn writeDirectoryTar(alloc: std.mem.Allocator, path: []const u8, writer: *std.Io
                 const stat = try file.stat();
                 var buf: [64 * 1024]u8 = undefined;
                 var reader = std.fs.File.Reader.initSize(file, &buf, stat.size);
-                try archive.writeFile(tar_path, &reader, stat.mtime);
+                // mtime 0, not stat.mtime: the archive bytes are the bundle
+                // cache key on target machines, so the same dependency set
+                // must produce the same bytes across rebuilds.
+                try archive.writeFile(tar_path, &reader, 0);
             },
             .sym_link => {
                 var target_buf: [4096]u8 = undefined;
@@ -469,7 +486,7 @@ fn readBundle(alloc: std.mem.Allocator) !?Bundle {
     return .{ .source = source, .deps_tar = deps_tar };
 }
 
-const BundlePaths = struct { dir: []const u8, script: []const u8 };
+const BundlePaths = struct { dir: []const u8, script: []const u8, fresh: bool };
 
 fn ensureBundle(alloc: std.mem.Allocator, cache_root: []const u8, src: []const u8, archive: []const u8) !BundlePaths {
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
@@ -482,22 +499,46 @@ fn ensureBundle(alloc: std.mem.Allocator, cache_root: []const u8, src: []const u
     const dir = try std.fmt.allocPrint(alloc, "{s}/bundles/{s}", .{ cache_root, hex[0..16] });
     const marker = try std.fmt.allocPrint(alloc, "{s}/.taipan-ok", .{dir});
     const script = try std.fmt.allocPrint(alloc, "{s}/.taipan-main.py", .{dir});
-    if (std.fs.cwd().access(marker, .{})) |_| return .{ .dir = dir, .script = script } else |_| {}
+    if (std.fs.cwd().access(marker, .{})) |_| return .{ .dir = dir, .script = script, .fresh = false } else |_| {}
 
-    std.fs.cwd().deleteTree(dir) catch {};
-    try std.fs.cwd().makePath(dir);
+    // Stage into a pid-suffixed sibling and rename into place, so a
+    // concurrent first launch never observes — or deletes — a half-extracted
+    // bundle. The marker is written before the rename: a directory at the
+    // final path is complete by construction.
+    const pid = if (is_windows) std.os.windows.GetCurrentProcessId() else std.c.getpid();
+    const tmp = try std.fmt.allocPrint(alloc, "{s}.tmp.{d}", .{ dir, pid });
+    errdefer std.fs.cwd().deleteTree(tmp) catch {};
+    std.fs.cwd().deleteTree(tmp) catch {};
+    try std.fs.cwd().makePath(tmp);
     if (archive.len > 0) {
-        var dest = try std.fs.cwd().openDir(dir, .{});
+        var dest = try std.fs.cwd().openDir(tmp, .{});
         defer dest.close();
         try tarx.extract(dest, archive);
     }
     {
-        var file = try std.fs.cwd().createFile(script, .{});
+        const tmp_script = try std.fmt.allocPrint(alloc, "{s}/.taipan-main.py", .{tmp});
+        var file = try std.fs.cwd().createFile(tmp_script, .{});
         defer file.close();
         try file.writeAll(src);
     }
-    (try std.fs.cwd().createFile(marker, .{})).close();
-    return .{ .dir = dir, .script = script };
+    const tmp_marker = try std.fmt.allocPrint(alloc, "{s}/.taipan-ok", .{tmp});
+    (try std.fs.cwd().createFile(tmp_marker, .{})).close();
+
+    std.fs.cwd().rename(tmp, dir) catch |err| switch (err) {
+        error.PathAlreadyExists => {
+            // Lost the race to a concurrent launch, or a partial directory
+            // from a crashed extraction is in the way. Keep a completed
+            // bundle; replace anything else.
+            if (std.fs.cwd().access(marker, .{})) |_| {
+                std.fs.cwd().deleteTree(tmp) catch {};
+                return .{ .dir = dir, .script = script, .fresh = false };
+            } else |_| {}
+            std.fs.cwd().deleteTree(dir) catch {};
+            try std.fs.cwd().rename(tmp, dir);
+        },
+        else => return err,
+    };
+    return .{ .dir = dir, .script = script, .fresh = true };
 }
 
 /// Cache root, always with '/' separators — they work in every Windows API

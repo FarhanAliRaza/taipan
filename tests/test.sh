@@ -150,6 +150,49 @@ echo "$out" | grep -q "taipan works with pure-python deps" && \
     test -f "$WORK"/bundle-dep-cache/bundles/*/.taipan-ok
 check "built executable carries PEP 723 dependencies" $? "$out"
 
+"$TAIPAN" build examples/compiled_dep.py -o "$WORK/shipped/compiled-dep" >/dev/null 2>&1
+out="$(cd "$WORK/shipped" && \
+    TAIPAN_CACHE="$WORK/bundle-ext-cache" TAIPAN_UV=/definitely/missing ./compiled-dep 2>&1)"
+echo "$out" | grep -q "WITH C extension"
+check "built executable carries a compiled extension" $? "$out"
+
+# Two builds of the same script must be byte-identical: the deps archive is
+# the bundle cache key on target machines.
+"$TAIPAN" build examples/pure_dep.py -o "$WORK/pure-dep-again" >/dev/null 2>&1 && \
+    cmp -s "$WORK/shipped/pure-dep" "$WORK/pure-dep-again"
+check "rebuilds are byte-identical" $?
+
+out="$("$TAIPAN" build examples/hello.py -o 2>&1)"
+[ $? -ne 0 ] && echo "$out" | grep -q "missing value for -o"
+check "build -o without a value is rejected" $? "$out"
+
+"$TAIPAN" build examples/hello.py -o "$WORK/corrupt" >/dev/null 2>&1
+size=$(wc -c < "$WORK/corrupt")
+# Flip a byte in a footer length field: the magic still matches, the recorded
+# sizes no longer add up to the file size.
+printf '\377' | dd of="$WORK/corrupt" bs=1 seek=$((size - 20)) conv=notrunc 2>/dev/null
+out="$("$WORK/corrupt" 2>&1)"; rc=$?
+[ "$rc" -eq 1 ] && echo "$out" | grep -q "corrupt"
+check "corrupt built executable fails with a clear error" $? "$out"
+
+mkdir -p "$WORK/local-project/pkg"
+cat > "$WORK/local-project/app.py" <<'EOF'
+import helper
+from pathlib import Path
+from pkg.answer import answer
+print(helper.message(), answer, Path(__file__).with_name("message.txt").read_text().strip())
+EOF
+echo 'def message(): return "local-module-ok"' > "$WORK/local-project/helper.py"
+echo 'from .answer import answer' > "$WORK/local-project/pkg/__init__.py"
+echo 'answer = 42' > "$WORK/local-project/pkg/answer.py"
+echo 'included-resource-ok' > "$WORK/local-project/message.txt"
+"$TAIPAN" build "$WORK/local-project/app.py" --include-local \
+    --include "$WORK/local-project/message.txt" -o "$WORK/shipped/local-app" >/dev/null 2>&1
+rm -rf "$WORK/local-project"
+out="$(TAIPAN_CACHE="$WORK/bundle-local-cache" "$WORK/shipped/local-app" 2>&1)"
+[ "$out" = "local-module-ok 42 included-resource-ok" ]
+check "build includes local modules, packages, and explicit resources" $? "$out"
+
 # --- threads and multiprocessing --------------------------------------------
 cat > "$WORK/concurrency.py" <<'EOF'
 import concurrent.futures
