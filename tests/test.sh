@@ -132,6 +132,116 @@ compiled="$("$TAIPAN" run examples/compiled_dep.py 2>&1)"
 echo "$compiled" | grep -q "WITH C extension"
 check "compiled extension wheel loads" $? "$compiled"
 
+# --- standalone builds -------------------------------------------------------
+"$TAIPAN" build examples/hello.py -o "$WORK/hello-built" >/dev/null 2>&1 && \
+    test -x "$WORK/hello-built"
+check "build creates an executable" $?
+
+mkdir "$WORK/shipped"
+mv "$WORK/hello-built" "$WORK/shipped/hello"
+out="$(cd "$WORK/shipped" && TAIPAN_CACHE="$WORK/bundle-cache" ./hello x 2>&1)"
+echo "$out" | grep -q "hello from taipan" && echo "$out" | grep -q "'x'"
+check "built executable runs without its source" $? "$out"
+
+"$TAIPAN" build examples/pure_dep.py -o "$WORK/shipped/pure-dep" >/dev/null 2>&1
+out="$(cd "$WORK/shipped" && \
+    TAIPAN_CACHE="$WORK/bundle-dep-cache" TAIPAN_UV=/definitely/missing ./pure-dep 2>&1)"
+echo "$out" | grep -q "taipan works with pure-python deps" && \
+    test -f "$WORK"/bundle-dep-cache/bundles/*/.taipan-ok
+check "built executable carries PEP 723 dependencies" $? "$out"
+
+"$TAIPAN" build examples/compiled_dep.py -o "$WORK/shipped/compiled-dep" >/dev/null 2>&1
+out="$(cd "$WORK/shipped" && \
+    TAIPAN_CACHE="$WORK/bundle-ext-cache" TAIPAN_UV=/definitely/missing ./compiled-dep 2>&1)"
+echo "$out" | grep -q "WITH C extension"
+check "built executable carries a compiled extension" $? "$out"
+
+# Two builds of the same script must be byte-identical: the deps archive is
+# the bundle cache key on target machines.
+"$TAIPAN" build examples/pure_dep.py -o "$WORK/pure-dep-again" >/dev/null 2>&1 && \
+    cmp -s "$WORK/shipped/pure-dep" "$WORK/pure-dep-again"
+check "rebuilds are byte-identical" $?
+
+out="$("$TAIPAN" build examples/hello.py -o 2>&1)"
+[ $? -ne 0 ] && echo "$out" | grep -q "missing value for -o"
+check "build -o without a value is rejected" $? "$out"
+
+"$TAIPAN" build examples/hello.py -o "$WORK/corrupt" >/dev/null 2>&1
+size=$(wc -c < "$WORK/corrupt")
+# Flip a byte in a footer length field: the magic still matches, the recorded
+# sizes no longer add up to the file size.
+printf '\377' | dd of="$WORK/corrupt" bs=1 seek=$((size - 20)) conv=notrunc 2>/dev/null
+out="$("$WORK/corrupt" 2>&1)"; rc=$?
+[ "$rc" -eq 1 ] && echo "$out" | grep -q "corrupt"
+check "corrupt built executable fails with a clear error" $? "$out"
+
+mkdir -p "$WORK/local-project/pkg"
+cat > "$WORK/local-project/app.py" <<'EOF'
+import helper
+from pathlib import Path
+from pkg.answer import answer
+print(helper.message(), answer, Path(__file__).with_name("message.txt").read_text().strip())
+EOF
+echo 'def message(): return "local-module-ok"' > "$WORK/local-project/helper.py"
+echo 'from .answer import answer' > "$WORK/local-project/pkg/__init__.py"
+echo 'answer = 42' > "$WORK/local-project/pkg/answer.py"
+echo 'included-resource-ok' > "$WORK/local-project/message.txt"
+"$TAIPAN" build "$WORK/local-project/app.py" --include-local \
+    --include "$WORK/local-project/message.txt" -o "$WORK/shipped/local-app" >/dev/null 2>&1
+rm -rf "$WORK/local-project"
+out="$(TAIPAN_CACHE="$WORK/bundle-local-cache" "$WORK/shipped/local-app" 2>&1)"
+[ "$out" = "local-module-ok 42 included-resource-ok" ]
+check "build includes local modules, packages, and explicit resources" $? "$out"
+
+# --- threads and multiprocessing --------------------------------------------
+cat > "$WORK/concurrency.py" <<'EOF'
+import concurrent.futures
+import multiprocessing as mp
+import sys
+
+def square(x):
+    return x * x
+
+if __name__ == "__main__":
+    with concurrent.futures.ThreadPoolExecutor(2) as pool:
+        assert list(pool.map(square, range(4))) == [0, 1, 4, 9]
+    with mp.get_context("spawn").Pool(2) as pool:
+        assert pool.map(square, range(4)) == [0, 1, 4, 9]
+    assert sys.executable
+    print("concurrency-ok")
+EOF
+out="$("$TAIPAN" run "$WORK/concurrency.py" 2>&1)"
+echo "$out" | grep -q "concurrency-ok"
+check "run supports threads and spawned processes" $? "$out"
+
+"$TAIPAN" build "$WORK/concurrency.py" -o "$WORK/shipped/concurrency" >/dev/null 2>&1
+rm "$WORK/concurrency.py"
+out="$(TAIPAN_CACHE="$WORK/bundle-concurrency-cache" \
+    "$WORK/shipped/concurrency" 2>&1)"
+echo "$out" | grep -q "concurrency-ok"
+check "built executable supports spawned processes" $? "$out"
+
+# --- worker protocol gating ---------------------------------------------------
+# TAIPAN_CHILD is inherited by every descendant of a taipan runtime; a `-c`
+# after a subcommand or script path must reach the script, not be executed
+# as the multiprocessing worker protocol.
+cat > "$WORK/argv_echo.py" <<'EOF'
+import sys
+print("argv:", sys.argv[1:])
+EOF
+out="$(TAIPAN_CHILD=1 "$TAIPAN" run "$WORK/argv_echo.py" -c "print('hijacked')" 2>&1)"
+echo "$out" | grep -qF "argv: ['-c'"
+check "nested -c stays a script argument" $? "$out"
+
+# --- duplicate bundle paths ----------------------------------------------------
+mkdir "$WORK/collide"
+printf 'import dup\nprint("dup:", dup.VALUE)\n' > "$WORK/collide/app.py"
+echo 'VALUE = "ok"' > "$WORK/collide/dup.py"
+out="$("$TAIPAN" build "$WORK/collide/app.py" --include-local \
+    --include "$WORK/collide/dup.py" -o "$WORK/collide-built" 2>&1)"
+echo "$out" | grep -q "bundled more than once"
+check "duplicate bundle path warns at build time" $? "$out"
+
 # --- isolation: no python3/uv on PATH ------------------------------------------
 # POSIX-only: on Windows the msys tools can't be meaningfully symlinked into a
 # bare PATH (they need their own DLLs), and env -i breaks Win32 API basics.

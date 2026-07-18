@@ -6,6 +6,8 @@
  * __main__, finalize, and return an exit code.
  *
  * stdlib_path      — path to stdlib.zip (imported via zipimport) or a dir.
+ * executable_path  — absolute launcher path exposed as sys.executable and
+ *                    used when multiprocessing re-execs the interpreter.
  * extra_sys_path   — dependency env dir, may be NULL/empty.
  * precompile_extra — if nonzero, run compileall on extra_sys_path after init
  *                    (first run after an install) so later runs never pay
@@ -19,7 +21,8 @@
  *                    Zig side hashes all three) so entries can't go stale.
  *                    Empty/NULL disables the cache.
  * argv becomes sys.argv verbatim (argv[0] should be the script path). */
-int taipan_run_file(const char *stdlib_path, const char *extra_sys_path,
+int taipan_run_file(const char *executable_path, const char *stdlib_path,
+                 const char *extra_sys_path,
                  int precompile_extra, const char *script_path,
                  const char *script_source, const char *pyc_path,
                  int argc, char **argv);
