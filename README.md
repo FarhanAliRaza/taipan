@@ -157,10 +157,11 @@ Spawned workers re-enter the embedded interpreter through `sys.executable` and
 inherit the script's dependency environment.
 
 `taipan build` appends the script and its installed dependency environment to
-a copy of the launcher. On first launch, the executable extracts its runtime
-and dependencies into a content-addressed cache, then runs the embedded script
-directly. Later launches reuse those files. The shipped artifact itself remains
-a single file.
+a copy of the launcher, plus a digest of the whole payload. On first launch,
+the executable verifies the payload against that digest and extracts its
+runtime and dependencies into a content-addressed cache, then runs the
+embedded script directly. Later launches read only the digest and reuse the
+extracted files. The shipped artifact itself remains a single file.
 
 The cache lives at `~/.cache/taipan` by default. Set `TAIPAN_CACHE` to move it,
 or `TAIPAN_UV` to use a specific `uv` executable.
@@ -231,6 +232,11 @@ toolchain script.
 - `sys.executable` points to the taipan launcher. Invoking it with a script or
   with Python's internal `-c` worker protocol is supported, but it is not a
   complete replacement for every CPython command-line option.
+- Programs run by taipan mark their descendants (via `TAIPAN_CHILD`) so the
+  multiprocessing re-exec of `sys.executable` is recognized. Inside such a
+  descendant, invoking taipan or a built application with `-c` preceded only
+  by `-`-style flags is treated as that worker protocol instead of passing
+  `-c` through as an ordinary argument.
 - PEP 723 parsing intentionally supports only the dependency syntax taipan
   needs. `requires-python` is not currently enforced.
 - Dependency sets are not locked. The first installation uses whatever

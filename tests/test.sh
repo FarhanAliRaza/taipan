@@ -221,6 +221,27 @@ out="$(TAIPAN_CACHE="$WORK/bundle-concurrency-cache" \
 echo "$out" | grep -q "concurrency-ok"
 check "built executable supports spawned processes" $? "$out"
 
+# --- worker protocol gating ---------------------------------------------------
+# TAIPAN_CHILD is inherited by every descendant of a taipan runtime; a `-c`
+# after a subcommand or script path must reach the script, not be executed
+# as the multiprocessing worker protocol.
+cat > "$WORK/argv_echo.py" <<'EOF'
+import sys
+print("argv:", sys.argv[1:])
+EOF
+out="$(TAIPAN_CHILD=1 "$TAIPAN" run "$WORK/argv_echo.py" -c "print('hijacked')" 2>&1)"
+echo "$out" | grep -qF "argv: ['-c'"
+check "nested -c stays a script argument" $? "$out"
+
+# --- duplicate bundle paths ----------------------------------------------------
+mkdir "$WORK/collide"
+printf 'import dup\nprint("dup:", dup.VALUE)\n' > "$WORK/collide/app.py"
+echo 'VALUE = "ok"' > "$WORK/collide/dup.py"
+out="$("$TAIPAN" build "$WORK/collide/app.py" --include-local \
+    --include "$WORK/collide/dup.py" -o "$WORK/collide-built" 2>&1)"
+echo "$out" | grep -q "bundled more than once"
+check "duplicate bundle path warns at build time" $? "$out"
+
 # --- isolation: no python3/uv on PATH ------------------------------------------
 # POSIX-only: on Windows the msys tools can't be meaningfully symlinked into a
 # bare PATH (they need their own DLLs), and env -i breaks Win32 API basics.

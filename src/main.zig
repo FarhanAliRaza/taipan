@@ -34,12 +34,18 @@ const usage =
     \\
 ;
 
-const bundle_magic = "TPNBNDL1";
-const bundle_footer_len = bundle_magic.len + 3 * @sizeOf(u64);
+const bundle_magic = "TPNBNDL2";
+const bundle_footer_len = bundle_magic.len + 3 * @sizeOf(u64) + 32;
 
-const Bundle = struct {
-    source: []u8,
-    deps_tar: []u8,
+const BundleFooter = struct {
+    base_len: u64,
+    source_len: u64,
+    deps_len: u64,
+    /// SHA-256 of runtime tag + script source + appended archive, computed
+    /// at build time. Doubles as the target-side bundle cache key — a warm
+    /// start never re-reads the payload — and as the integrity check on
+    /// first extraction.
+    digest: [32]u8,
 };
 
 pub fn main() !void {
@@ -54,25 +60,20 @@ pub fn main() !void {
     // deliberately enabled only in descendants of an active taipan runtime,
     // so `-c` remains an ordinary argument to a built application.
     if (std.process.hasEnvVarConstant("TAIPAN_CHILD")) {
-        for (args[1..], 1..) |arg, i| {
-            if (std.mem.eql(u8, arg, "-c") and i + 1 < args.len) try runCommand(alloc, args, i);
-        }
+        if (workerCommandIndex(args)) |i| try runCommand(alloc, args, i);
     }
 
     // A built executable is the normal taipan launcher with a script and its
     // dependency environment appended. It always runs that embedded script;
     // every command-line argument belongs to the script.
-    const maybe_bundle = readBundle(alloc) catch |err| switch (err) {
+    const maybe_footer = readBundleFooter(alloc) catch |err| switch (err) {
         error.InvalidBundle => {
             std.debug.print("taipan: this executable is corrupt (truncated or modified after `taipan build`)\n", .{});
             std.process.exit(1);
         },
         else => return err,
     };
-    if (maybe_bundle) |bundle| {
-        const self_path = try std.fs.selfExePathAlloc(alloc);
-        try runScript(alloc, args, 0, self_path, bundle.source, bundle.deps_tar);
-    }
+    if (maybe_footer) |footer| try runBundle(alloc, args, footer);
 
     if (args.len >= 2 and std.mem.eql(u8, args[1], "build")) {
         try buildCommand(alloc, args);
@@ -96,7 +97,27 @@ pub fn main() !void {
     // file reader would skip) is a syntax error.
     if (std.mem.startsWith(u8, src, "\xEF\xBB\xBF")) src = src[3..];
 
-    try runScript(alloc, args, script_idx, script_path, src, null);
+    try runScript(alloc, args, script_idx, script_path, src);
+}
+
+/// Recognize CPython's re-exec shape — `sys.executable [interpreter flags]
+/// -c <prog> ...` — and nothing else. TAIPAN_CHILD is inherited by every
+/// descendant of a taipan runtime, including nested `taipan run ...`
+/// invocations, so a `-c` that follows a non-flag argument (a subcommand or
+/// a script path) must stay an ordinary argument.
+fn workerCommandIndex(args: []const []const u8) ?usize {
+    var i: usize = 1;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (std.mem.eql(u8, arg, "-c")) return if (i + 1 < args.len) i else null;
+        // `-X opt` and `-W filter` carry their value as a separate argument.
+        if (std.mem.eql(u8, arg, "-X") or std.mem.eql(u8, arg, "-W")) {
+            i += 1;
+            continue;
+        }
+        if (arg.len < 2 or arg[0] != '-') return null;
+    }
+    return null;
 }
 
 fn runScript(
@@ -105,34 +126,58 @@ fn runScript(
     script_idx: usize,
     script_path: []const u8,
     src: []u8,
-    bundled_deps: ?[]const u8,
 ) !noreturn {
     const cache_root = try cacheRoot(alloc);
-    var effective_script = script_path;
     var extra_path: []const u8 = "";
     var fresh_env = false;
-    if (bundled_deps) |archive| {
-        const bundle = try ensureBundle(alloc, cache_root, src, archive);
-        effective_script = bundle.script;
-        if (archive.len > 0) {
-            extra_path = bundle.dir;
-            fresh_env = bundle.fresh;
-        }
-    } else {
-        const deps = try pep723.parseDeps(alloc, src);
-        if (deps.len > 0) {
-            const env = try ensureEnv(alloc, cache_root, deps);
-            extra_path = env.dir;
-            fresh_env = env.fresh;
-        }
+    const deps = try pep723.parseDeps(alloc, src);
+    if (deps.len > 0) {
+        const env = try ensureEnv(alloc, cache_root, deps);
+        extra_path = env.dir;
+        fresh_env = env.fresh;
+    }
+    try execResolved(alloc, cache_root, args, script_idx, script_path, src, extra_path, fresh_env);
+}
+
+/// Run the script embedded in this executable. A warm start reads only the
+/// footer and the cached copy of the script: the footer digest already names
+/// the extracted bundle dir, so the appended archive is never re-read.
+fn runBundle(alloc: std.mem.Allocator, args: []const []const u8, footer: BundleFooter) !noreturn {
+    const cache_root = try cacheRoot(alloc);
+    const hex = std.fmt.bytesToHex(footer.digest, .lower);
+    const dir = try std.fmt.allocPrint(alloc, "{s}/bundles/{s}", .{ cache_root, hex[0..16] });
+    const marker = try std.fmt.allocPrint(alloc, "{s}/.taipan-ok", .{dir});
+    const script = try std.fmt.allocPrint(alloc, "{s}/.taipan-main.py", .{dir});
+
+    var fresh = false;
+    if (std.fs.cwd().access(marker, .{})) |_| {} else |_| {
+        fresh = try extractBundle(alloc, footer, dir, marker);
     }
 
+    const src = std.fs.cwd().readFileAlloc(alloc, script, 16 * 1024 * 1024) catch {
+        std.debug.print("taipan: bundle cache at {s} is unreadable; delete it and rerun\n", .{dir});
+        std.process.exit(1);
+    };
+    const extra_path: []const u8 = if (footer.deps_len > 0) dir else "";
+    try execResolved(alloc, cache_root, args, 0, script, src, extra_path, fresh);
+}
+
+fn execResolved(
+    alloc: std.mem.Allocator,
+    cache_root: []const u8,
+    args: []const []const u8,
+    script_idx: usize,
+    script_path: []const u8,
+    src: []const u8,
+    extra_path: []const u8,
+    fresh_env: bool,
+) !noreturn {
     // Absolute path (with '/' separators) for __file__ and traceback
     // filenames: it stays valid however the cwd changes, and it is part of
     // the compiled-script cache key.
     const abs_script = blk: {
         const cwd = try std.process.getCwdAlloc(alloc);
-        const p = try std.fs.path.resolve(alloc, &.{ cwd, effective_script });
+        const p = try std.fs.path.resolve(alloc, &.{ cwd, script_path });
         if (is_windows) std.mem.replaceScalar(u8, p, '\\', '/');
         break :blk p;
     };
@@ -173,6 +218,9 @@ fn runCommand(alloc: std.mem.Allocator, args: []const []const u8, command_idx: u
     const rt = try ensureRuntime(alloc, cache_root);
     const extra_path = std.process.getEnvVarOwned(alloc, "TAIPAN_CHILD_PATH") catch "";
 
+    // Interpreter flags preceding -c (e.g. -B/-E from CPython's
+    // _args_from_interpreter_flags) are dropped: the embedded config is
+    // already isolated, so they are no-ops here.
     // Python's `-c` argv excludes the command string itself.
     const py_argc = args.len - command_idx - 1;
     const argv_z = try alloc.alloc([*c]u8, py_argc);
@@ -202,6 +250,10 @@ fn buildCommand(alloc: std.mem.Allocator, args: []const []const u8) !void {
     }
 
     const script_path = args[2];
+    if (script_path.len == 0 or script_path[0] == '-') {
+        std.debug.print("taipan: expected a script path before build options\n{s}", .{usage});
+        std.process.exit(2);
+    }
     var output: ?[]const u8 = null;
     var include_local = false;
     var includes: std.ArrayList([]const u8) = .empty;
@@ -282,25 +334,53 @@ fn buildCommand(alloc: std.mem.Allocator, args: []const []const u8) !void {
         _ = try out_writer.interface.sendFileAll(&launcher_reader, .unlimited);
         try out_writer.interface.writeAll(src);
 
+        // The sections below form one continuous tar stream: tar entries are
+        // self-delimiting, and std.tar.Writer never emits the two-zero-block
+        // end-of-archive terminator (extraction relies on plain EOF). A
+        // finish()/terminator between sections would truncate extraction.
+        var seen = std.BufSet.init(alloc);
         const deps_start = launcher_stat.size + src.len;
-        if (env_dir) |dir| try writeDirectoryTar(alloc, dir, &out_writer.interface);
+        if (env_dir) |dir| try writeDirectoryTar(alloc, dir, &out_writer.interface, &seen);
         if (include_local) {
             const script_dir = std.fs.path.dirname(abs_script) orelse cwd;
-            try writeLocalPythonTar(alloc, script_dir, std.fs.path.basename(abs_script), &out_writer.interface);
+            try writeLocalPythonTar(alloc, script_dir, std.fs.path.basename(abs_script), &out_writer.interface, &seen);
         }
         for (includes.items) |include_path| {
             const abs_include = try std.fs.path.resolve(alloc, &.{ cwd, include_path });
-            try writeIncludedPathTar(alloc, abs_include, &out_writer.interface);
+            try writeIncludedPathTar(alloc, abs_include, &out_writer.interface, &seen);
         }
         try out_writer.interface.flush();
         const payload_end = try output_file.getPos();
         const deps_len = payload_end - deps_start;
+
+        // Hash the archive back from the temp file (it was streamed to disk,
+        // never held in memory) through a separate handle so the writer's
+        // file position is untouched.
+        var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+        hasher.update(build_options.runtime_tag);
+        hasher.update(src);
+        {
+            var check = try std.fs.openFileAbsolute(tmp_path, .{});
+            defer check.close();
+            try check.seekTo(deps_start);
+            var remaining = deps_len;
+            var chunk: [64 * 1024]u8 = undefined;
+            while (remaining > 0) {
+                const want: usize = @intCast(@min(chunk.len, remaining));
+                if (try check.readAll(chunk[0..want]) != want) return error.UnexpectedEndOfFile;
+                hasher.update(chunk[0..want]);
+                remaining -= want;
+            }
+        }
+        var digest: [32]u8 = undefined;
+        hasher.final(&digest);
 
         var footer: [bundle_footer_len]u8 = undefined;
         @memcpy(footer[0..bundle_magic.len], bundle_magic);
         std.mem.writeInt(u64, footer[8..16], launcher_stat.size, .little);
         std.mem.writeInt(u64, footer[16..24], src.len, .little);
         std.mem.writeInt(u64, footer[24..32], deps_len, .little);
+        @memcpy(footer[32..64], &digest);
         try out_writer.interface.writeAll(&footer);
         try out_writer.end();
     }
@@ -319,16 +399,33 @@ fn buildCommand(alloc: std.mem.Allocator, args: []const []const u8) !void {
     std.debug.print("taipan: built {s} ({d} dependencies, {d} explicit includes)\n", .{ output_path, deps.len, includes.items.len });
 }
 
+/// The bundle's tar sections extract into one directory in order
+/// (dependencies, local modules, explicit includes), and a repeated path is
+/// silently overwritten by the last copy. Warn at build time instead of
+/// surprising at run time.
+fn noteBundlePath(seen: *std.BufSet, path: []const u8) !void {
+    if (std.mem.eql(u8, path, ".taipan-ok") or std.mem.eql(u8, path, ".taipan-main.py")) {
+        std.debug.print("taipan: warning: {s} is reserved by the taipan runtime and will be replaced\n", .{path});
+        return;
+    }
+    if (seen.contains(path)) {
+        std.debug.print("taipan: warning: {s} is bundled more than once; the last copy wins\n", .{path});
+        return;
+    }
+    try seen.insert(path);
+}
+
 fn writeLocalPythonTar(
     alloc: std.mem.Allocator,
     root_path: []const u8,
     entry_name: []const u8,
     writer: *std.Io.Writer,
+    seen: *std.BufSet,
 ) !void {
     var root = try std.fs.cwd().openDir(root_path, .{ .iterate = true });
     defer root.close();
     var archive: std.tar.Writer = .{ .underlying_writer = writer };
-    try writeLocalPythonDir(alloc, root, "", entry_name, &archive);
+    try writeLocalPythonDir(alloc, root, "", entry_name, &archive, seen);
 }
 
 fn writeLocalPythonDir(
@@ -337,6 +434,7 @@ fn writeLocalPythonDir(
     prefix: []const u8,
     entry_name: []const u8,
     archive: *std.tar.Writer,
+    seen: *std.BufSet,
 ) !void {
     var iter = dir.iterate();
     while (try iter.next()) |entry| {
@@ -350,11 +448,12 @@ fn writeLocalPythonDir(
                 try archive.writeDir(path, .{});
                 var child = try dir.openDir(entry.name, .{ .iterate = true });
                 defer child.close();
-                try writeLocalPythonDir(alloc, child, path, entry_name, archive);
+                try writeLocalPythonDir(alloc, child, path, entry_name, archive, seen);
             },
             .file => {
                 if (!std.mem.eql(u8, std.fs.path.extension(entry.name), ".py")) continue;
                 if (prefix.len == 0 and std.mem.eql(u8, entry.name, entry_name)) continue;
+                try noteBundlePath(seen, path);
                 try writeTarFile(dir, entry.name, path, archive);
             },
             else => {},
@@ -372,7 +471,7 @@ fn isIgnoredLocalDir(name: []const u8) bool {
     return false;
 }
 
-fn writeIncludedPathTar(alloc: std.mem.Allocator, abs_path: []const u8, writer: *std.Io.Writer) !void {
+fn writeIncludedPathTar(alloc: std.mem.Allocator, abs_path: []const u8, writer: *std.Io.Writer, seen: *std.BufSet) !void {
     const parent_path = std.fs.path.dirname(abs_path) orelse return error.InvalidIncludePath;
     const name = std.fs.path.basename(abs_path);
     var parent = try std.fs.openDirAbsolute(parent_path, .{ .iterate = true });
@@ -380,18 +479,21 @@ fn writeIncludedPathTar(alloc: std.mem.Allocator, abs_path: []const u8, writer: 
     const stat = try parent.statFile(name);
     var archive: std.tar.Writer = .{ .underlying_writer = writer };
     switch (stat.kind) {
-        .file => try writeTarFile(parent, name, name, &archive),
+        .file => {
+            try noteBundlePath(seen, name);
+            try writeTarFile(parent, name, name, &archive);
+        },
         .directory => {
             try archive.writeDir(name, .{});
             var child = try parent.openDir(name, .{ .iterate = true });
             defer child.close();
-            try writeAllDir(alloc, child, name, &archive);
+            try writeAllDir(alloc, child, name, &archive, seen);
         },
         else => return error.UnsupportedIncludeFileType,
     }
 }
 
-fn writeAllDir(alloc: std.mem.Allocator, dir: std.fs.Dir, prefix: []const u8, archive: *std.tar.Writer) !void {
+fn writeAllDir(alloc: std.mem.Allocator, dir: std.fs.Dir, prefix: []const u8, archive: *std.tar.Writer, seen: *std.BufSet) !void {
     var iter = dir.iterate();
     while (try iter.next()) |entry| {
         const path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ prefix, entry.name });
@@ -400,12 +502,16 @@ fn writeAllDir(alloc: std.mem.Allocator, dir: std.fs.Dir, prefix: []const u8, ar
                 try archive.writeDir(path, .{});
                 var child = try dir.openDir(entry.name, .{ .iterate = true });
                 defer child.close();
-                try writeAllDir(alloc, child, path, archive);
+                try writeAllDir(alloc, child, path, archive, seen);
             },
-            .file => try writeTarFile(dir, entry.name, path, archive),
+            .file => {
+                try noteBundlePath(seen, path);
+                try writeTarFile(dir, entry.name, path, archive);
+            },
             .sym_link => {
                 var target_buf: [4096]u8 = undefined;
                 const target = try dir.readLink(entry.name, &target_buf);
+                try noteBundlePath(seen, path);
                 try archive.writeLink(path, target, .{});
             },
             else => return error.UnsupportedIncludeFileType,
@@ -422,7 +528,7 @@ fn writeTarFile(dir: std.fs.Dir, source_name: []const u8, archive_path: []const 
     try archive.writeFile(archive_path, &reader, 0);
 }
 
-fn writeDirectoryTar(alloc: std.mem.Allocator, path: []const u8, writer: *std.Io.Writer) !void {
+fn writeDirectoryTar(alloc: std.mem.Allocator, path: []const u8, writer: *std.Io.Writer, seen: *std.BufSet) !void {
     var root = try std.fs.cwd().openDir(path, .{ .iterate = true });
     defer root.close();
     var walker = try root.walk(alloc);
@@ -444,6 +550,7 @@ fn writeDirectoryTar(alloc: std.mem.Allocator, path: []const u8, writer: *std.Io
                 const stat = try file.stat();
                 var buf: [64 * 1024]u8 = undefined;
                 var reader = std.fs.File.Reader.initSize(file, &buf, stat.size);
+                try noteBundlePath(seen, tar_path);
                 // mtime 0, not stat.mtime: the archive bytes are the bundle
                 // cache key on target machines, so the same dependency set
                 // must produce the same bytes across rebuilds.
@@ -452,6 +559,7 @@ fn writeDirectoryTar(alloc: std.mem.Allocator, path: []const u8, writer: *std.Io
             .sym_link => {
                 var target_buf: [4096]u8 = undefined;
                 const target = try entry.dir.readLink(entry.basename, &target_buf);
+                try noteBundlePath(seen, tar_path);
                 try archive.writeLink(tar_path, target, .{});
             },
             else => return error.UnsupportedDependencyFileType,
@@ -459,7 +567,7 @@ fn writeDirectoryTar(alloc: std.mem.Allocator, path: []const u8, writer: *std.Io
     }
 }
 
-fn readBundle(alloc: std.mem.Allocator) !?Bundle {
+fn readBundleFooter(alloc: std.mem.Allocator) !?BundleFooter {
     const self_path = try std.fs.selfExePathAlloc(alloc);
     var file = try std.fs.openFileAbsolute(self_path, .{});
     defer file.close();
@@ -477,29 +585,40 @@ fn readBundle(alloc: std.mem.Allocator) !?Bundle {
     const expected_payload = std.math.add(u64, expected, deps_len) catch return error.InvalidBundle;
     const expected_size = std.math.add(u64, expected_payload, bundle_footer_len) catch return error.InvalidBundle;
     if (expected_size != size or source_len > 16 * 1024 * 1024) return error.InvalidBundle;
-
-    const source = try alloc.alloc(u8, @intCast(source_len));
-    const deps_tar = try alloc.alloc(u8, @intCast(deps_len));
-    try file.seekTo(base_len);
-    if (try file.readAll(source) != source.len or try file.readAll(deps_tar) != deps_tar.len)
-        return error.InvalidBundle;
-    return .{ .source = source, .deps_tar = deps_tar };
+    return .{
+        .base_len = base_len,
+        .source_len = source_len,
+        .deps_len = deps_len,
+        .digest = footer[32..64].*,
+    };
 }
 
-const BundlePaths = struct { dir: []const u8, script: []const u8, fresh: bool };
-
-fn ensureBundle(alloc: std.mem.Allocator, cache_root: []const u8, src: []const u8, archive: []const u8) !BundlePaths {
-    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
-    hasher.update(build_options.runtime_tag);
-    hasher.update(src);
-    hasher.update(archive);
-    var digest: [32]u8 = undefined;
-    hasher.final(&digest);
-    const hex = std.fmt.bytesToHex(digest, .lower);
-    const dir = try std.fmt.allocPrint(alloc, "{s}/bundles/{s}", .{ cache_root, hex[0..16] });
-    const marker = try std.fmt.allocPrint(alloc, "{s}/.taipan-ok", .{dir});
-    const script = try std.fmt.allocPrint(alloc, "{s}/.taipan-main.py", .{dir});
-    if (std.fs.cwd().access(marker, .{})) |_| return .{ .dir = dir, .script = script, .fresh = false } else |_| {}
+/// Read the payload appended to this executable, verify it against the
+/// footer digest, and stage it into `dir`. Returns true when this process
+/// performed the extraction (the caller should precompile), false when a
+/// concurrent launch won the race.
+fn extractBundle(alloc: std.mem.Allocator, footer: BundleFooter, dir: []const u8, marker: []const u8) !bool {
+    const self_path = try std.fs.selfExePathAlloc(alloc);
+    var file = try std.fs.openFileAbsolute(self_path, .{});
+    defer file.close();
+    const source = try alloc.alloc(u8, @intCast(footer.source_len));
+    const archive = try alloc.alloc(u8, @intCast(footer.deps_len));
+    try file.seekTo(footer.base_len);
+    const intact = blk: {
+        if (try file.readAll(source) != source.len) break :blk false;
+        if (try file.readAll(archive) != archive.len) break :blk false;
+        var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+        hasher.update(build_options.runtime_tag);
+        hasher.update(source);
+        hasher.update(archive);
+        var digest: [32]u8 = undefined;
+        hasher.final(&digest);
+        break :blk std.mem.eql(u8, &digest, &footer.digest);
+    };
+    if (!intact) {
+        std.debug.print("taipan: this executable is corrupt (truncated or modified after `taipan build`)\n", .{});
+        std.process.exit(1);
+    }
 
     // Stage into a pid-suffixed sibling and rename into place, so a
     // concurrent first launch never observes — or deletes — a half-extracted
@@ -517,9 +636,9 @@ fn ensureBundle(alloc: std.mem.Allocator, cache_root: []const u8, src: []const u
     }
     {
         const tmp_script = try std.fmt.allocPrint(alloc, "{s}/.taipan-main.py", .{tmp});
-        var file = try std.fs.cwd().createFile(tmp_script, .{});
-        defer file.close();
-        try file.writeAll(src);
+        var out = try std.fs.cwd().createFile(tmp_script, .{});
+        defer out.close();
+        try out.writeAll(source);
     }
     const tmp_marker = try std.fmt.allocPrint(alloc, "{s}/.taipan-ok", .{tmp});
     (try std.fs.cwd().createFile(tmp_marker, .{})).close();
@@ -531,14 +650,14 @@ fn ensureBundle(alloc: std.mem.Allocator, cache_root: []const u8, src: []const u
             // bundle; replace anything else.
             if (std.fs.cwd().access(marker, .{})) |_| {
                 std.fs.cwd().deleteTree(tmp) catch {};
-                return .{ .dir = dir, .script = script, .fresh = false };
+                return false;
             } else |_| {}
             std.fs.cwd().deleteTree(dir) catch {};
             try std.fs.cwd().rename(tmp, dir);
         },
         else => return err,
     };
-    return .{ .dir = dir, .script = script, .fresh = true };
+    return true;
 }
 
 /// Cache root, always with '/' separators — they work in every Windows API
