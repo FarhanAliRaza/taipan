@@ -39,11 +39,11 @@ the current release:
 
 | Platform | Download |
 | --- | --- |
-| Linux x86_64 | [taipan-linux-x86_64](https://github.com/FarhanAliRaza/taipan/releases/download/v0.2.0/taipan-linux-x86_64) |
-| Linux ARM64 | [taipan-linux-aarch64](https://github.com/FarhanAliRaza/taipan/releases/download/v0.2.0/taipan-linux-aarch64) |
-| macOS Apple Silicon | [taipan-macos-aarch64](https://github.com/FarhanAliRaza/taipan/releases/download/v0.2.0/taipan-macos-aarch64) |
-| macOS Intel | [taipan-macos-x86_64](https://github.com/FarhanAliRaza/taipan/releases/download/v0.2.0/taipan-macos-x86_64) |
-| Windows x86_64 | [taipan-windows-x86_64.exe](https://github.com/FarhanAliRaza/taipan/releases/download/v0.2.0/taipan-windows-x86_64.exe) |
+| Linux x86_64 | [taipan-linux-x86_64](https://github.com/FarhanAliRaza/taipan/releases/download/v0.3.0/taipan-linux-x86_64) |
+| Linux ARM64 | [taipan-linux-aarch64](https://github.com/FarhanAliRaza/taipan/releases/download/v0.3.0/taipan-linux-aarch64) |
+| macOS Apple Silicon | [taipan-macos-aarch64](https://github.com/FarhanAliRaza/taipan/releases/download/v0.3.0/taipan-macos-aarch64) |
+| macOS Intel | [taipan-macos-x86_64](https://github.com/FarhanAliRaza/taipan/releases/download/v0.3.0/taipan-macos-x86_64) |
+| Windows x86_64 | [taipan-windows-x86_64.exe](https://github.com/FarhanAliRaza/taipan/releases/download/v0.3.0/taipan-windows-x86_64.exe) |
 
 Direct binary downloads do not preserve executable permissions. On Linux or
 macOS, make a manual download executable and give it a stable name:
