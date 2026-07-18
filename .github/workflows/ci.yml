@@ -50,6 +50,25 @@ jobs:
       - name: Check formatting
         run: ./vendor/zig/zig fmt --check src build.zig
 
+      - name: Test installer
+        if: runner.os != 'Windows'
+        run: |
+          sh -n install.sh tests/install.sh
+          sh tests/install.sh
+
+      - name: Check PowerShell installer syntax
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $errors = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path ./install.ps1), [ref]$null, [ref]$errors
+          )
+          if ($errors.Count) {
+            $errors | Format-List | Out-String | Write-Error
+            exit 1
+          }
+
       - name: Unit tests
         run: ./vendor/zig/zig build test ${{ matrix.buildflags || '' }}
 

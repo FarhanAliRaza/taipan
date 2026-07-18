@@ -18,7 +18,24 @@ runs go straight to the cached environment.
 
 ## Install
 
-Download the binary for your platform from the current release:
+On Linux or macOS:
+
+```sh
+curl -LsSf https://raw.githubusercontent.com/FarhanAliRaza/taipan/main/install.sh | sh
+```
+
+On Windows PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/FarhanAliRaza/taipan/main/install.ps1 | iex
+```
+
+The installer detects the platform, downloads the current release as
+`taipan` (`taipan.exe` on Windows), and makes it executable. It installs to
+`~/.local/bin` by default; set `TAIPAN_INSTALL_DIR` to choose another location.
+
+To download a binary manually instead, use the platform-specific artifact from
+the current release:
 
 | Platform | Download |
 | --- | --- |
@@ -28,7 +45,8 @@ Download the binary for your platform from the current release:
 | macOS Intel | [taipan-macos-x86_64](https://github.com/FarhanAliRaza/taipan/releases/download/v0.2.0/taipan-macos-x86_64) |
 | Windows x86_64 | [taipan-windows-x86_64.exe](https://github.com/FarhanAliRaza/taipan/releases/download/v0.2.0/taipan-windows-x86_64.exe) |
 
-On Linux or macOS, rename the download and make it executable:
+Direct binary downloads do not preserve executable permissions. On Linux or
+macOS, make a manual download executable and give it a stable name:
 
 ```sh
 mv taipan-<platform> taipan
@@ -36,8 +54,8 @@ chmod +x taipan
 sudo mv taipan /usr/local/bin/
 ```
 
-On Windows, rename the downloaded file to `taipan.exe` and place it somewhere
-on your `PATH`.
+On Windows, rename a manual download to `taipan.exe` and place it somewhere on
+your `PATH`.
 
 You can also browse [all releases](https://github.com/FarhanAliRaza/taipan/releases).
 
