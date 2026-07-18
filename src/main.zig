@@ -30,7 +30,7 @@ const usage =
     \\usage:
     \\  taipan <script.py> [args...]
     \\  taipan run <script.py> [args...]
-    \\  taipan build <script.py> [-o <output>]
+    \\  taipan build <script.py> [-o <output>] [--include-local] [--include <path>]...
     \\
 ;
 
@@ -193,6 +193,8 @@ fn buildCommand(alloc: std.mem.Allocator, args: []const []const u8) !void {
 
     const script_path = args[2];
     var output: ?[]const u8 = null;
+    var include_local = false;
+    var includes: std.ArrayList([]const u8) = .empty;
     var i: usize = 3;
     while (i < args.len) {
         if ((std.mem.eql(u8, args[i], "-o") or std.mem.eql(u8, args[i], "--output")) and i + 1 < args.len) {
@@ -201,6 +203,16 @@ fn buildCommand(alloc: std.mem.Allocator, args: []const []const u8) !void {
                 std.process.exit(2);
             }
             output = args[i + 1];
+            i += 2;
+        } else if (std.mem.eql(u8, args[i], "--include-local")) {
+            include_local = true;
+            i += 1;
+        } else if (std.mem.eql(u8, args[i], "--include")) {
+            if (i + 1 >= args.len) {
+                std.debug.print("taipan: missing value for --include\n", .{});
+                std.process.exit(2);
+            }
+            try includes.append(alloc, args[i + 1]);
             i += 2;
         } else {
             std.debug.print("taipan: unknown build option: {s}\n", .{args[i]});
@@ -258,6 +270,14 @@ fn buildCommand(alloc: std.mem.Allocator, args: []const []const u8) !void {
 
         const deps_start = launcher_stat.size + src.len;
         if (env_dir) |dir| try writeDirectoryTar(alloc, dir, &out_writer.interface);
+        if (include_local) {
+            const script_dir = std.fs.path.dirname(abs_script) orelse cwd;
+            try writeLocalPythonTar(alloc, script_dir, std.fs.path.basename(abs_script), &out_writer.interface);
+        }
+        for (includes.items) |include_path| {
+            const abs_include = try std.fs.path.resolve(alloc, &.{ cwd, include_path });
+            try writeIncludedPathTar(alloc, abs_include, &out_writer.interface);
+        }
         try out_writer.interface.flush();
         const payload_end = try output_file.getPos();
         const deps_len = payload_end - deps_start;
@@ -282,7 +302,110 @@ fn buildCommand(alloc: std.mem.Allocator, args: []const []const u8) !void {
         defer built.close();
         try built.chmod(0o755);
     }
-    std.debug.print("taipan: built {s} ({d} dependencies)\n", .{ output_path, deps.len });
+    std.debug.print("taipan: built {s} ({d} dependencies, {d} explicit includes)\n", .{ output_path, deps.len, includes.items.len });
+}
+
+fn writeLocalPythonTar(
+    alloc: std.mem.Allocator,
+    root_path: []const u8,
+    entry_name: []const u8,
+    writer: *std.Io.Writer,
+) !void {
+    var root = try std.fs.cwd().openDir(root_path, .{ .iterate = true });
+    defer root.close();
+    var archive: std.tar.Writer = .{ .underlying_writer = writer };
+    try writeLocalPythonDir(alloc, root, "", entry_name, &archive);
+}
+
+fn writeLocalPythonDir(
+    alloc: std.mem.Allocator,
+    dir: std.fs.Dir,
+    prefix: []const u8,
+    entry_name: []const u8,
+    archive: *std.tar.Writer,
+) !void {
+    var iter = dir.iterate();
+    while (try iter.next()) |entry| {
+        if (isIgnoredLocalDir(entry.name)) continue;
+        const path = if (prefix.len == 0)
+            try alloc.dupe(u8, entry.name)
+        else
+            try std.fmt.allocPrint(alloc, "{s}/{s}", .{ prefix, entry.name });
+        switch (entry.kind) {
+            .directory => {
+                try archive.writeDir(path, .{});
+                var child = try dir.openDir(entry.name, .{ .iterate = true });
+                defer child.close();
+                try writeLocalPythonDir(alloc, child, path, entry_name, archive);
+            },
+            .file => {
+                if (!std.mem.eql(u8, std.fs.path.extension(entry.name), ".py")) continue;
+                if (prefix.len == 0 and std.mem.eql(u8, entry.name, entry_name)) continue;
+                try writeTarFile(dir, entry.name, path, archive);
+            },
+            else => {},
+        }
+    }
+}
+
+fn isIgnoredLocalDir(name: []const u8) bool {
+    for ([_][]const u8{
+        ".git", ".hg",         ".svn",         ".venv",     "venv",
+        "env",  "__pycache__", "node_modules", "zig-cache", "zig-out",
+    }) |ignored| {
+        if (std.mem.eql(u8, name, ignored)) return true;
+    }
+    return false;
+}
+
+fn writeIncludedPathTar(alloc: std.mem.Allocator, abs_path: []const u8, writer: *std.Io.Writer) !void {
+    const parent_path = std.fs.path.dirname(abs_path) orelse return error.InvalidIncludePath;
+    const name = std.fs.path.basename(abs_path);
+    var parent = try std.fs.openDirAbsolute(parent_path, .{ .iterate = true });
+    defer parent.close();
+    const stat = try parent.statFile(name);
+    var archive: std.tar.Writer = .{ .underlying_writer = writer };
+    switch (stat.kind) {
+        .file => try writeTarFile(parent, name, name, &archive),
+        .directory => {
+            try archive.writeDir(name, .{});
+            var child = try parent.openDir(name, .{ .iterate = true });
+            defer child.close();
+            try writeAllDir(alloc, child, name, &archive);
+        },
+        else => return error.UnsupportedIncludeFileType,
+    }
+}
+
+fn writeAllDir(alloc: std.mem.Allocator, dir: std.fs.Dir, prefix: []const u8, archive: *std.tar.Writer) !void {
+    var iter = dir.iterate();
+    while (try iter.next()) |entry| {
+        const path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ prefix, entry.name });
+        switch (entry.kind) {
+            .directory => {
+                try archive.writeDir(path, .{});
+                var child = try dir.openDir(entry.name, .{ .iterate = true });
+                defer child.close();
+                try writeAllDir(alloc, child, path, archive);
+            },
+            .file => try writeTarFile(dir, entry.name, path, archive),
+            .sym_link => {
+                var target_buf: [4096]u8 = undefined;
+                const target = try dir.readLink(entry.name, &target_buf);
+                try archive.writeLink(path, target, .{});
+            },
+            else => return error.UnsupportedIncludeFileType,
+        }
+    }
+}
+
+fn writeTarFile(dir: std.fs.Dir, source_name: []const u8, archive_path: []const u8, archive: *std.tar.Writer) !void {
+    var file = try dir.openFile(source_name, .{});
+    defer file.close();
+    const stat = try file.stat();
+    var buf: [64 * 1024]u8 = undefined;
+    var reader = std.fs.File.Reader.initSize(file, &buf, stat.size);
+    try archive.writeFile(archive_path, &reader, 0);
 }
 
 fn writeDirectoryTar(alloc: std.mem.Allocator, path: []const u8, writer: *std.Io.Writer) !void {

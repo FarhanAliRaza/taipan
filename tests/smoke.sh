@@ -54,18 +54,26 @@ out=$("$BIN" /tmp/smoke_boom.py 2>&1);          check traceback 1 $? "$out" "Val
 cp "$EXAMPLES/hello.py" "$work/hello.py"
 cp "$EXAMPLES/compiled_dep.py" "$work/compiled_dep.py"
 echo 'import sys; sys.exit(7)' > "$work/exit7.py"
+echo 'VALUE = "local-module-ok"' > "$work/smoke_helper.py"
+echo 'explicit-resource-ok' > "$work/smoke-resource.txt"
+printf '\nimport smoke_helper\nfrom pathlib import Path\nprint(smoke_helper.VALUE)\nprint(Path(__file__).with_name("smoke-resource.txt").read_text().strip())\n' >> "$work/hello.py"
 
-out=$(TAIPAN_CACHE="$work/build-cache" "$BIN" build "$work/hello.py" -o "$work/hello-built" 2>&1)
+out=$(TAIPAN_CACHE="$work/build-cache" "$BIN" build "$work/hello.py" --include-local \
+  --include "$work/smoke-resource.txt" -o "$work/hello-built" 2>&1)
 check build-hello 0 $? "$out" "built"
 out=$(TAIPAN_CACHE="$work/build-cache" "$BIN" build "$work/compiled_dep.py" -o "$work/compiled-built" 2>&1)
 check build-compiled-dep 0 $? "$out" "built"
 out=$(TAIPAN_CACHE="$work/build-cache" "$BIN" build "$work/exit7.py" -o "$work/exit7-built" 2>&1)
 check build-exit-code 0 $? "$out" "built"
 
-rm -f "$work/hello.py" "$work/compiled_dep.py" "$work/exit7.py"
+rm -f "$work/hello.py" "$work/compiled_dep.py" "$work/exit7.py" \
+  "$work/smoke_helper.py" "$work/smoke-resource.txt"
 out=$(cd /tmp && TAIPAN_CACHE="$work/run-cache" TAIPAN_UV="$work/missing-uv" \
   "$work/hello-built" docker-arg 2>&1)
-check built-hello 0 $? "$out" "docker-arg"
+rc=$?
+check built-hello 0 $rc "$out" "docker-arg"
+check built-local-module 0 $rc "$out" "local-module-ok"
+check built-explicit-resource 0 $rc "$out" "explicit-resource-ok"
 out=$(cd /tmp && TAIPAN_CACHE="$work/run-cache" TAIPAN_UV="$work/missing-uv" \
   "$work/compiled-built" 2>&1)
 check built-compiled-dep 0 $? "$out" "WITH C extension"

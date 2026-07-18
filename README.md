@@ -82,6 +82,19 @@ taipan build app.py -o app
 ./app [args...]
 ```
 
+Include sibling modules and local packages rooted beside the entry script with
+`--include-local`. Add resources or dynamically loaded files explicitly with a
+repeatable `--include`:
+
+```sh
+taipan build app.py -o app --include-local \
+  --include templates/ --include settings.json
+```
+
+`--include-local` recursively includes `.py` files while skipping common
+environment, cache, VCS, and build directories. Explicitly included files and
+directories keep their basename at the application bundle root.
+
 The output name defaults to the script name without `.py` (with `.exe` added
 on Windows). The built file can be copied to another machine of the same
 platform and run without the source script, Python, uv, or network access.
@@ -198,6 +211,6 @@ toolchain script.
   certificate store.
 - The first run extracts the bundled runtime into the local cache and therefore
   uses additional disk space.
-- Standalone builds bundle one PEP 723 script and its declared dependencies;
-  they do not yet discover and include adjacent local modules or package an
-  entire `pyproject.toml` project.
+- Standalone builds package one script rather than an entire
+  `pyproject.toml` project. Use `--include-local` and `--include` for local
+  modules and application resources.
