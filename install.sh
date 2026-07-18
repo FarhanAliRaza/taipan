@@ -25,7 +25,8 @@ case "$os" in
     Linux) platform=linux ;;
     Darwin) platform=macos ;;
     *) err "unsupported operating system: $os
-On Windows, download taipan-windows-x86_64.exe from https://github.com/$REPO/releases" ;;
+On Windows, run the PowerShell installer instead:
+  powershell -ExecutionPolicy Bypass -Command \"irm https://raw.githubusercontent.com/$REPO/main/install.ps1 | iex\"" ;;
 esac
 
 arch=$(uname -m)

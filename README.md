@@ -29,9 +29,15 @@ release, and installs it to `~/.local/bin`. Set `TAIPAN_INSTALL_DIR` to
 install somewhere else, or `TAIPAN_VERSION` (e.g. `v0.2.0`) to pin a specific
 release.
 
-On Windows, download
-[taipan-windows-x86_64.exe](https://github.com/FarhanAliRaza/taipan/releases/latest/download/taipan-windows-x86_64.exe),
-rename it to `taipan.exe`, and place it somewhere on your `PATH`.
+On Windows (PowerShell):
+
+```powershell
+powershell -ExecutionPolicy Bypass -Command "irm https://raw.githubusercontent.com/FarhanAliRaza/taipan/main/install.ps1 | iex"
+```
+
+This installs `taipan.exe` to `%LOCALAPPDATA%\Programs\taipan` and adds that
+directory to your user `PATH`. The same `TAIPAN_INSTALL_DIR` and
+`TAIPAN_VERSION` variables apply.
 
 ### Manual download
 
