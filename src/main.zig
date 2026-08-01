@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const build_options = @import("build_options");
 const pep723 = @import("pep723.zig");
 const tarx = @import("tarx.zig");
+const entrypoints = @import("entrypoints.zig");
 
 const is_windows = builtin.os.tag == .windows;
 
@@ -13,12 +14,14 @@ const stdlib_zip = @embedFile("stdlib_zip");
 const libpython_so = @embedFile("libpython_so");
 const shim_so = @embedFile("shim_so");
 const extra_tar = @embedFile("extra_tar");
+const include_tar_gz = @embedFile("include_tar_gz");
 
 const RunFileFn = *const fn (
     executable_path: [*:0]const u8,
     stdlib_path: [*:0]const u8,
-    extra_sys_path: [*:0]const u8,
-    precompile_extra: c_int,
+    extra_paths: [*c]const [*c]const u8,
+    extra_path_count: c_int,
+    precompile_dir: [*:0]const u8,
     script_path: [*:0]const u8,
     script_source: [*:0]const u8,
     pyc_path: [*:0]const u8,
@@ -26,11 +29,19 @@ const RunFileFn = *const fn (
     argv: [*c][*c]u8,
 ) callconv(.c) c_int;
 
+/// NUL-terminate each path for the shim's `const char *const *`.
+fn dupeZPaths(alloc: std.mem.Allocator, paths: []const []const u8) ![]const [*c]const u8 {
+    const out = try alloc.alloc([*c]const u8, paths.len);
+    for (paths, out) |path, *slot| slot.* = (try alloc.dupeZ(u8, path)).ptr;
+    return out;
+}
+
 const usage =
     \\usage:
     \\  taipan <script.py> [args...]
     \\  taipan run <script.py> [args...]
     \\  taipan build <script.py> [-o <output>] [--include-local] [--include <path>]...
+    \\  taipan build <package|directory> [-e <console-script>] [-o <output>] [--include <path>]...
     \\
 ;
 
@@ -56,11 +67,18 @@ pub fn main() !void {
     const args = try std.process.argsAlloc(alloc);
 
     // CPython's multiprocessing helpers re-exec sys.executable with `-c` for
-    // the resource tracker, fork server, and spawned workers. This mode is
-    // deliberately enabled only in descendants of an active taipan runtime,
-    // so `-c` remains an ordinary argument to a built application.
-    if (std.process.hasEnvVarConstant("TAIPAN_CHILD")) {
-        if (workerCommandIndex(args)) |i| try runCommand(alloc, args, i);
+    // the resource tracker, fork server, and spawned workers, and uv probes
+    // an interpreter the same way (`-I -B -c <query>`). Both modes are
+    // deliberately enabled only by an env var taipan itself sets, so `-c`
+    // remains an ordinary argument to a built application.
+    const command_mode: ?CommandMode = if (std.process.hasEnvVarConstant("TAIPAN_PYTHON"))
+        .build_interpreter
+    else if (std.process.hasEnvVarConstant("TAIPAN_CHILD"))
+        .worker
+    else
+        null;
+    if (command_mode) |mode| {
+        if (workerCommandIndex(args)) |i| try runCommand(alloc, args, i, mode);
     }
 
     // A built executable is the normal taipan launcher with a script and its
@@ -199,11 +217,17 @@ fn execResolved(
     const run_file = loadShim(alloc, rt);
     const self_path = try std.fs.selfExePathAlloc(alloc);
 
+    // A script run has at most the one dependency environment, and it is also
+    // what a fresh install precompiles.
+    const one = [_][]const u8{extra_path};
+    const extra_z = try dupeZPaths(alloc, if (extra_path.len > 0) one[0..] else &.{});
+
     const rc = run_file(
         (try alloc.dupeZ(u8, self_path)).ptr,
         (try alloc.dupeZ(u8, rt.stdlib_zip)).ptr,
-        (try alloc.dupeZ(u8, extra_path)).ptr,
-        @intFromBool(fresh_env),
+        extra_z.ptr,
+        @intCast(extra_z.len),
+        (try alloc.dupeZ(u8, if (fresh_env) extra_path else "")).ptr,
         (try alloc.dupeZ(u8, abs_script)).ptr,
         (try alloc.dupeZ(u8, src)).ptr,
         (try alloc.dupeZ(u8, pyc_path)).ptr,
@@ -213,10 +237,60 @@ fn execResolved(
     std.process.exit(if (rc < 0) 1 else @intCast(@min(rc, 255)));
 }
 
-fn runCommand(alloc: std.mem.Allocator, args: []const []const u8, command_idx: usize) !noreturn {
+/// Why this process is honouring a `-c`. Both are marked by an environment
+/// variable taipan itself sets, and a build backend that uses multiprocessing
+/// has both set at once — `build_interpreter` wins, because everything under
+/// uv still needs the build environment on sys.path.
+const CommandMode = enum { worker, build_interpreter };
+
+/// uv runs PEP 517 build hooks as `<venv>/bin/python -c ...`, where that
+/// python is a symlink to this executable. `selfExePath` resolves the symlink
+/// and so loses the venv, but argv[0] still names it: a venv is the parent of
+/// the directory holding the interpreter, marked by a pyvenv.cfg.
+fn venvSitePackages(alloc: std.mem.Allocator, argv0: []const u8) !?[]const u8 {
+    const bin_dir = std.fs.path.dirname(argv0) orelse return null;
+    const root = std.fs.path.dirname(bin_dir) orelse return null;
+    const cfg = try std.fmt.allocPrint(alloc, "{s}/pyvenv.cfg", .{root});
+    std.fs.cwd().access(cfg, .{}) catch return null;
+    return if (is_windows)
+        try std.fmt.allocPrint(alloc, "{s}/Lib/site-packages", .{root})
+    else
+        try std.fmt.allocPrint(alloc, "{s}/lib/python{s}/site-packages", .{ root, build_options.python_version });
+}
+
+/// sys.path additions for a `-c` invocation: the dependency environment
+/// carried across a multiprocessing re-exec, plus — under uv — the build
+/// venv's site-packages and $PYTHONPATH. A stock python derives those two
+/// from argv[0] and the environment; the embedded config is isolated and
+/// imports no `site`, so they have to be added by hand.
+fn commandSearchPath(
+    alloc: std.mem.Allocator,
+    args: []const []const u8,
+    mode: CommandMode,
+) ![]const []const u8 {
+    var paths: std.ArrayList([]const u8) = .empty;
+    if (std.process.getEnvVarOwned(alloc, "TAIPAN_CHILD_PATH")) |p| {
+        if (p.len > 0) try paths.append(alloc, p);
+    } else |_| {}
+    if (mode == .build_interpreter and args.len > 0) {
+        if (try venvSitePackages(alloc, args[0])) |sp| try paths.append(alloc, sp);
+        if (std.process.getEnvVarOwned(alloc, "PYTHONPATH")) |p| {
+            var it = std.mem.tokenizeScalar(u8, p, if (is_windows) ';' else ':');
+            while (it.next()) |entry| try paths.append(alloc, entry);
+        } else |_| {}
+    }
+    return paths.items;
+}
+
+fn runCommand(
+    alloc: std.mem.Allocator,
+    args: []const []const u8,
+    command_idx: usize,
+    mode: CommandMode,
+) !noreturn {
     const cache_root = try cacheRoot(alloc);
     const rt = try ensureRuntime(alloc, cache_root);
-    const extra_path = std.process.getEnvVarOwned(alloc, "TAIPAN_CHILD_PATH") catch "";
+    const extra_z = try dupeZPaths(alloc, try commandSearchPath(alloc, args, mode));
 
     // Interpreter flags preceding -c (e.g. -B/-E from CPython's
     // _args_from_interpreter_flags) are dropped: the embedded config is
@@ -232,8 +306,9 @@ fn runCommand(alloc: std.mem.Allocator, args: []const []const u8, command_idx: u
     const rc = run_file(
         (try alloc.dupeZ(u8, self_path)).ptr,
         (try alloc.dupeZ(u8, rt.stdlib_zip)).ptr,
-        (try alloc.dupeZ(u8, extra_path)).ptr,
-        0,
+        extra_z.ptr,
+        @intCast(extra_z.len),
+        "",
         "<string>",
         (try alloc.dupeZ(u8, args[command_idx + 1])).ptr,
         "",
@@ -243,20 +318,43 @@ fn runCommand(alloc: std.mem.Allocator, args: []const []const u8, command_idx: u
     std.process.exit(if (rc < 0) 1 else @intCast(@min(rc, 255)));
 }
 
+const BuildOptions = struct {
+    output: ?[]const u8 = null,
+    include_local: bool = false,
+    includes: std.ArrayList([]const u8) = .empty,
+    entrypoint: ?[]const u8 = null,
+};
+
+/// Everything the bundle writer needs, however the input was described.
+const BuildInput = struct {
+    /// Python source that becomes the bundle's `__main__`.
+    src: []const u8,
+    /// Installed environment to append to the bundle, if any.
+    env_dir: ?[]const u8 = null,
+    /// The input script, when building one: the output must not overwrite it,
+    /// and `--include-local` walks its directory. Empty for a package build.
+    abs_script: []const u8 = "",
+    /// Output name when `-o` is absent, without any executable suffix.
+    default_name: []const u8,
+    /// Environment to delete once the build is written, for inputs that
+    /// cannot be content-addressed and so are installed fresh every time.
+    scratch_env: ?[]const u8 = null,
+    /// Leading half of the "taipan: built ..." line.
+    summary: []const u8,
+};
+
 fn buildCommand(alloc: std.mem.Allocator, args: []const []const u8) !void {
     if (args.len < 3) {
         std.debug.print(usage, .{});
         std.process.exit(2);
     }
 
-    const script_path = args[2];
-    if (script_path.len == 0 or script_path[0] == '-') {
-        std.debug.print("taipan: expected a script path before build options\n{s}", .{usage});
+    const target = args[2];
+    if (target.len == 0 or target[0] == '-') {
+        std.debug.print("taipan: expected a script, directory or package before build options\n{s}", .{usage});
         std.process.exit(2);
     }
-    var output: ?[]const u8 = null;
-    var include_local = false;
-    var includes: std.ArrayList([]const u8) = .empty;
+    var opts: BuildOptions = .{};
     var i: usize = 3;
     while (i < args.len) {
         if (std.mem.eql(u8, args[i], "-o") or std.mem.eql(u8, args[i], "--output")) {
@@ -264,56 +362,89 @@ fn buildCommand(alloc: std.mem.Allocator, args: []const []const u8) !void {
                 std.debug.print("taipan: missing value for {s}\n", .{args[i]});
                 std.process.exit(2);
             }
-            if (output != null) {
+            if (opts.output != null) {
                 std.debug.print("taipan: output specified more than once\n", .{});
                 std.process.exit(2);
             }
-            output = args[i + 1];
+            opts.output = args[i + 1];
+            i += 2;
+        } else if (std.mem.eql(u8, args[i], "-e") or std.mem.eql(u8, args[i], "--entrypoint")) {
+            if (i + 1 >= args.len) {
+                std.debug.print("taipan: missing value for {s}\n", .{args[i]});
+                std.process.exit(2);
+            }
+            if (opts.entrypoint != null) {
+                std.debug.print("taipan: entry point specified more than once\n", .{});
+                std.process.exit(2);
+            }
+            opts.entrypoint = args[i + 1];
             i += 2;
         } else if (std.mem.eql(u8, args[i], "--include-local")) {
-            include_local = true;
+            opts.include_local = true;
             i += 1;
         } else if (std.mem.eql(u8, args[i], "--include")) {
             if (i + 1 >= args.len) {
                 std.debug.print("taipan: missing value for --include\n", .{});
                 std.process.exit(2);
             }
-            try includes.append(alloc, args[i + 1]);
+            try opts.includes.append(alloc, args[i + 1]);
             i += 2;
         } else {
             std.debug.print("taipan: unknown build option: {s}\n", .{args[i]});
             std.process.exit(2);
         }
     }
-    const output_path = output orelse blk: {
-        const stem = std.fs.path.stem(std.fs.path.basename(script_path));
-        break :blk if (is_windows)
-            try std.fmt.allocPrint(alloc, "{s}.exe", .{stem})
-        else
-            try alloc.dupe(u8, stem);
+
+    const cache_root = try cacheRoot(alloc);
+
+    // A script is built from its own source. Anything else — a project
+    // directory or a requirement like `omniload==0.7.0` — is installed, and
+    // the bundle is built around one of its console scripts. A path that ends
+    // in .py is a script whether or not it exists, so a typo is reported as
+    // the missing file it is rather than as an unresolvable requirement.
+    const input = if (isRegularFile(target) or std.mem.endsWith(u8, target, ".py")) blk: {
+        if (opts.entrypoint != null) {
+            std.debug.print("taipan: -e applies to package builds, but {s} is a script\n", .{target});
+            std.process.exit(2);
+        }
+        break :blk try prepareScriptBuild(alloc, cache_root, target);
+    } else blk: {
+        if (opts.include_local) {
+            std.debug.print("taipan: --include-local applies to script builds; a package's own modules are installed by uv\n", .{});
+            std.process.exit(2);
+        }
+        // All four are reported where they happen, and the scratch env is
+        // released by errdefer on the way out; nothing is left to say here.
+        break :blk preparePackageBuild(alloc, cache_root, target, opts.entrypoint) catch |err| switch (err) {
+            error.InvalidEntryPointSpec => std.process.exit(2),
+            error.InstallFailed,
+            error.EnvironmentUnreadable,
+            error.EntryPointUnavailable,
+            => std.process.exit(1),
+            else => return err,
+        };
+    };
+    defer if (input.scratch_env) |dir| {
+        std.fs.cwd().deleteTree(dir) catch {};
     };
 
-    var src = std.fs.cwd().readFileAlloc(alloc, script_path, 16 * 1024 * 1024) catch |err| {
-        std.debug.print("taipan: cannot read {s}: {s}\n", .{ script_path, @errorName(err) });
-        std.process.exit(1);
-    };
-    if (std.mem.startsWith(u8, src, "\xEF\xBB\xBF")) src = src[3..];
+    const src = input.src;
+
+    const output_path = opts.output orelse if (is_windows)
+        try std.fmt.allocPrint(alloc, "{s}.exe", .{input.default_name})
+    else
+        input.default_name;
 
     const cwd = try std.process.getCwdAlloc(alloc);
     const abs_output = try std.fs.path.resolve(alloc, &.{ cwd, output_path });
-    const abs_script = try std.fs.path.resolve(alloc, &.{ cwd, script_path });
     const self_path = try std.fs.selfExePathAlloc(alloc);
-    if (std.mem.eql(u8, abs_output, self_path) or std.mem.eql(u8, abs_output, abs_script)) {
+    if (std.mem.eql(u8, abs_output, self_path) or std.mem.eql(u8, abs_output, input.abs_script)) {
         std.debug.print("taipan: refusing to overwrite the launcher or input script\n", .{});
         std.process.exit(1);
     }
-
-    const cache_root = try cacheRoot(alloc);
-    const deps = try pep723.parseDeps(alloc, src);
-    var env_dir: ?[]const u8 = null;
-    if (deps.len > 0) {
-        const env = try ensureEnv(alloc, cache_root, deps);
-        env_dir = env.dir;
+    if (isDirectory(abs_output)) {
+        std.debug.print("taipan: output {s} is a directory\n", .{output_path});
+        std.process.exit(1);
     }
 
     const pid = if (is_windows) std.os.windows.GetCurrentProcessId() else std.c.getpid();
@@ -340,12 +471,12 @@ fn buildCommand(alloc: std.mem.Allocator, args: []const []const u8) !void {
         // finish()/terminator between sections would truncate extraction.
         var seen = std.BufSet.init(alloc);
         const deps_start = launcher_stat.size + src.len;
-        if (env_dir) |dir| try writeDirectoryTar(alloc, dir, &out_writer.interface, &seen);
-        if (include_local) {
-            const script_dir = std.fs.path.dirname(abs_script) orelse cwd;
-            try writeLocalPythonTar(alloc, script_dir, std.fs.path.basename(abs_script), &out_writer.interface, &seen);
+        if (input.env_dir) |dir| try writeDirectoryTar(alloc, dir, &out_writer.interface, &seen);
+        if (opts.include_local) {
+            const script_dir = std.fs.path.dirname(input.abs_script) orelse cwd;
+            try writeLocalPythonTar(alloc, script_dir, std.fs.path.basename(input.abs_script), &out_writer.interface, &seen);
         }
-        for (includes.items) |include_path| {
+        for (opts.includes.items) |include_path| {
             const abs_include = try std.fs.path.resolve(alloc, &.{ cwd, include_path });
             try writeIncludedPathTar(alloc, abs_include, &out_writer.interface, &seen);
         }
@@ -396,7 +527,209 @@ fn buildCommand(alloc: std.mem.Allocator, args: []const []const u8) !void {
         defer built.close();
         try built.chmod(0o755);
     }
-    std.debug.print("taipan: built {s} ({d} dependencies, {d} explicit includes)\n", .{ output_path, deps.len, includes.items.len });
+    std.debug.print("taipan: built {s} ({s}, {d} explicit includes)\n", .{ output_path, input.summary, opts.includes.items.len });
+}
+
+fn prepareScriptBuild(alloc: std.mem.Allocator, cache_root: []const u8, script_path: []const u8) !BuildInput {
+    var src = std.fs.cwd().readFileAlloc(alloc, script_path, 16 * 1024 * 1024) catch |err| {
+        std.debug.print("taipan: cannot read {s}: {s}\n", .{ script_path, @errorName(err) });
+        std.process.exit(1);
+    };
+    if (std.mem.startsWith(u8, src, "\xEF\xBB\xBF")) src = src[3..];
+
+    const cwd = try std.process.getCwdAlloc(alloc);
+    const deps = try pep723.parseDeps(alloc, src);
+    var env_dir: ?[]const u8 = null;
+    if (deps.len > 0) env_dir = (try ensureEnv(alloc, cache_root, deps)).dir;
+
+    return .{
+        .src = src,
+        .env_dir = env_dir,
+        .abs_script = try std.fs.path.resolve(alloc, &.{ cwd, script_path }),
+        .default_name = std.fs.path.stem(std.fs.path.basename(script_path)),
+        .summary = try std.fmt.allocPrint(alloc, "{d} dependencies", .{deps.len}),
+    };
+}
+
+/// Build around a distribution rather than a script: install `spec` — a
+/// project directory or any requirement uv understands — then generate a
+/// `__main__` that invokes one of its console scripts.
+fn preparePackageBuild(
+    alloc: std.mem.Allocator,
+    cache_root: []const u8,
+    spec: []const u8,
+    requested: ?[]const u8,
+) !BuildInput {
+    const cwd = try std.process.getCwdAlloc(alloc);
+    const local = isDirectory(spec);
+    const requirement = if (local) try std.fs.path.resolve(alloc, &.{ cwd, spec }) else spec;
+
+    // A directory's contents change between builds, so its install cannot be
+    // content-addressed by the requirement string the way a pinned release
+    // can. Install into a private directory and discard it afterwards; uv's
+    // own cache still keeps the dependency downloads.
+    const pid = if (is_windows) std.os.windows.GetCurrentProcessId() else std.c.getpid();
+    const scratch_env: ?[]const u8 = if (local)
+        try std.fmt.allocPrint(alloc, "{s}/build/{d}", .{ cache_root, pid })
+    else
+        null;
+    errdefer if (scratch_env) |dir| {
+        std.fs.cwd().deleteTree(dir) catch {};
+    };
+
+    const env_dir = if (scratch_env) |dir| blk: {
+        std.fs.cwd().deleteTree(dir) catch {};
+        std.debug.print("taipan: installing {s}...\n", .{spec});
+        try installEnv(alloc, cache_root, dir, &.{requirement});
+        break :blk dir;
+    } else (try ensureEnv(alloc, cache_root, &.{requirement})).dir;
+
+    const installed = try collectEntryPoints(alloc, env_dir);
+
+    // Which of the installed distributions is the one being packaged: for a
+    // requirement, the name it starts with; for a directory, whichever
+    // distribution records that it came from a path (PEP 610), falling back
+    // to the name pyproject.toml declares.
+    const target_dist: ?[]const u8 = blk: {
+        if (!local) break :blk try entrypoints.requirementName(alloc, spec);
+        if (installed.direct_dist) |dist| break :blk dist;
+        const toml_path = try std.fmt.allocPrint(alloc, "{s}/pyproject.toml", .{requirement});
+        const toml = std.fs.cwd().readFileAlloc(alloc, toml_path, 1024 * 1024) catch break :blk null;
+        break :blk try entrypoints.projectName(alloc, toml);
+    };
+
+    const script = try resolveConsoleScript(installed, target_dist, requested, spec);
+
+    return .{
+        .src = try entrypoints.generateMain(alloc, script.name, script.target),
+        .env_dir = env_dir,
+        .default_name = script.name,
+        .scratch_env = scratch_env,
+        .summary = try std.fmt.allocPrint(
+            alloc,
+            "entry point {s} -> {s}:{s}, {d} packages",
+            .{ script.name, script.target.module, script.target.attr, installed.dist_count },
+        ),
+    };
+}
+
+const ConsoleScript = struct { name: []const u8, target: entrypoints.Target };
+
+/// Decide which console script the built executable runs, reporting to the
+/// user on failure. `requested` is either a script name or, for packages that
+/// declare no console script for what you want to run, a `module:function`
+/// import target given directly.
+fn resolveConsoleScript(
+    installed: InstalledScripts,
+    target_dist: ?[]const u8,
+    requested: ?[]const u8,
+    spec: []const u8,
+) error{ InvalidEntryPointSpec, EntryPointUnavailable }!ConsoleScript {
+    if (requested) |want| {
+        if (std.mem.indexOfScalar(u8, want, ':') != null) {
+            const target = entrypoints.parseTarget(want) orelse {
+                std.debug.print("taipan: -e {s} is not a valid module:function target\n", .{want});
+                return error.InvalidEntryPointSpec;
+            };
+            const dot = std.mem.indexOfScalar(u8, target.module, '.') orelse target.module.len;
+            return .{ .name = target_dist orelse target.module[0..dot], .target = target };
+        }
+    }
+
+    const ep = entrypoints.select(installed.entries, target_dist, requested) catch |err| {
+        switch (err) {
+            error.EntryPointNotFound => std.debug.print(
+                "taipan: no installed console script is named {s}\n",
+                .{requested.?},
+            ),
+            error.NoEntryPoints => std.debug.print(
+                "taipan: {s} declares no console scripts; name one with -e, or -e module:function\n",
+                .{spec},
+            ),
+            error.AmbiguousEntryPoint => std.debug.print(
+                "taipan: more than one console script matches; choose one with -e\n",
+                .{},
+            ),
+        }
+        listConsoleScripts(installed.entries, target_dist);
+        return error.EntryPointUnavailable;
+    };
+    const target = entrypoints.parseTarget(ep.value) orelse {
+        std.debug.print("taipan: console script {s} has an unsupported target: {s}\n", .{ ep.name, ep.value });
+        return error.EntryPointUnavailable;
+    };
+    return .{ .name = ep.name, .target = target };
+}
+
+fn listConsoleScripts(entries: []const entrypoints.EntryPoint, target_dist: ?[]const u8) void {
+    if (entries.len == 0) return;
+    std.debug.print("  available console scripts:\n", .{});
+    for (entries) |e| {
+        const own = if (target_dist) |d| std.mem.eql(u8, e.dist, d) else false;
+        std.debug.print("    {s}{s} = {s}  (from {s})\n", .{
+            if (own) "* " else "  ",
+            e.name,
+            e.value,
+            e.dist,
+        });
+    }
+}
+
+const InstalledScripts = struct {
+    entries: []entrypoints.EntryPoint,
+    dist_count: usize,
+    /// Normalized name of the one distribution installed from a path or URL,
+    /// when exactly one was.
+    direct_dist: ?[]const u8,
+};
+
+/// Read the `[console_scripts]` of every distribution installed in `env_dir`
+/// — the same `*.dist-info/entry_points.txt` files `importlib.metadata` reads,
+/// without needing an interpreter to read them.
+fn collectEntryPoints(alloc: std.mem.Allocator, env_dir: []const u8) !InstalledScripts {
+    var entries: std.ArrayList(entrypoints.EntryPoint) = .empty;
+    var dist_count: usize = 0;
+    var direct: ?[]const u8 = null;
+    var direct_count: usize = 0;
+
+    var dir = std.fs.cwd().openDir(env_dir, .{ .iterate = true }) catch |err| {
+        std.debug.print("taipan: cannot read the installed environment at {s}: {s}\n", .{ env_dir, @errorName(err) });
+        return error.EnvironmentUnreadable;
+    };
+    defer dir.close();
+
+    var it = dir.iterate();
+    while (try it.next()) |entry| {
+        if (entry.kind != .directory) continue;
+        const dist = try entrypoints.distFromDistInfo(alloc, entry.name) orelse continue;
+        dist_count += 1;
+        // PEP 610: only requirements given as a path or URL record their
+        // origin, which is exactly the distribution being packaged.
+        const url_path = try std.fmt.allocPrint(alloc, "{s}/direct_url.json", .{entry.name});
+        if (dir.access(url_path, .{})) |_| {
+            direct_count += 1;
+            direct = dist;
+        } else |_| {}
+        const eps_path = try std.fmt.allocPrint(alloc, "{s}/entry_points.txt", .{entry.name});
+        const text = dir.readFileAlloc(alloc, eps_path, 1024 * 1024) catch continue;
+        try entrypoints.parseEntryPoints(alloc, dist, text, &entries);
+    }
+    return .{
+        .entries = entries.items,
+        .dist_count = dist_count,
+        .direct_dist = if (direct_count == 1) direct else null,
+    };
+}
+
+fn isRegularFile(path: []const u8) bool {
+    const stat = std.fs.cwd().statFile(path) catch return false;
+    return stat.kind == .file;
+}
+
+fn isDirectory(path: []const u8) bool {
+    var dir = std.fs.cwd().openDir(path, .{}) catch return false;
+    dir.close();
+    return true;
 }
 
 /// The bundle's tar sections extract into one directory in order
@@ -736,6 +1069,50 @@ fn ensureRuntime(alloc: std.mem.Allocator, cache_root: []const u8) !Runtime {
     return rt;
 }
 
+/// Make the runtime dir look enough like an installed CPython to compile
+/// against: headers where sysconfig reports the include directory, and a
+/// linkable libpython under the lib directory it reports. Kept out of
+/// `ensureRuntime` and given a marker of its own, because a run that installs
+/// nothing should not pay for several hundred files it will never open.
+fn ensureBuildFiles(alloc: std.mem.Allocator, rt: Runtime) !void {
+    const dir = std.fs.path.dirname(rt.stdlib_zip).?;
+    const marker = try std.fmt.allocPrint(alloc, "{s}/.taipan-build-ok", .{dir});
+    if (std.fs.cwd().access(marker, .{})) |_| return else |_| {}
+
+    var dest = try std.fs.cwd().openDir(dir, .{});
+    defer dest.close();
+    try tarx.extractGzip(alloc, dest, include_tar_gz);
+    try linkLibPython(alloc, dir);
+    (try std.fs.cwd().createFile(marker, .{})).close();
+}
+
+/// The runtime keeps libpython at its root under the versioned name the
+/// dynamic loader wants (`libpython3.13.so.1.0`). A linker asked for
+/// `-lpython3.13` looks for the development name instead, in the `lib` dir
+/// that sysconfig advertises as LIBDIR — so put one there pointing back.
+/// Extension modules need none of this: on Linux and macOS they deliberately
+/// don't link libpython and resolve Py* symbols from the loaded interpreter.
+/// Packages that *embed* Python (uWSGI is the common one) do link it.
+fn linkLibPython(alloc: std.mem.Allocator, runtime_dir: []const u8) !void {
+    // Windows links against python313.lib, an import library the runtime does
+    // not carry; an embedding build there needs a real CPython install.
+    if (is_windows) return;
+
+    const lib_dir = try std.fmt.allocPrint(alloc, "{s}/lib", .{runtime_dir});
+    try std.fs.cwd().makePath(lib_dir);
+    const suffix = if (builtin.os.tag == .macos) "dylib" else "so";
+    const link = try std.fmt.allocPrint(
+        alloc,
+        "{s}/libpython{s}.{s}",
+        .{ lib_dir, build_options.python_version, suffix },
+    );
+    const target = try std.fmt.allocPrint(alloc, "../{s}", .{build_options.libpython_name});
+    std.fs.cwd().symLink(target, link, .{}) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return err,
+    };
+}
+
 fn extractFile(alloc: std.mem.Allocator, dest: []const u8, data: []const u8, executable: bool) !void {
     const pid = if (is_windows) std.os.windows.GetCurrentProcessId() else std.c.getpid();
     const tmp = try std.fmt.allocPrint(alloc, "{s}.tmp.{d}", .{ dest, pid });
@@ -801,7 +1178,7 @@ const EnvResult = struct { dir: []const u8, fresh: bool };
 /// `uv pip install --target` on first use. Cache key = sorted dep list +
 /// interpreter tag, so uv never runs on a warm start. `fresh` tells the
 /// caller to precompile the env in-process.
-fn ensureEnv(alloc: std.mem.Allocator, cache_root: []const u8, deps: [][]const u8) !EnvResult {
+fn ensureEnv(alloc: std.mem.Allocator, cache_root: []const u8, deps: []const []const u8) !EnvResult {
     const sorted = try alloc.dupe([]const u8, deps);
     std.mem.sort([]const u8, sorted, {}, strLessThan);
 
@@ -823,21 +1200,70 @@ fn ensureEnv(alloc: std.mem.Allocator, cache_root: []const u8, deps: [][]const u
         return .{ .dir = env_dir, .fresh = false };
     } else |_| {}
 
-    std.debug.print("taipan: installing {d} dependencies into cache...\n", .{deps.len});
+    // A package build always installs exactly one requirement, and naming it
+    // beats calling a package its own dependency.
+    if (deps.len == 1) {
+        std.debug.print("taipan: installing {s} into cache...\n", .{deps[0]});
+    } else {
+        std.debug.print("taipan: installing {d} dependencies into cache...\n", .{deps.len});
+    }
+    installEnv(alloc, cache_root, env_dir, deps) catch |err| switch (err) {
+        error.InstallFailed => std.process.exit(1),
+        else => return err,
+    };
 
+    (try std.fs.cwd().createFile(marker, .{})).close();
+    return .{ .dir = env_dir, .fresh = true };
+}
+
+/// Populate `env_dir` with `requirements` and everything they need, resolved
+/// for the embedded interpreter rather than for any Python on this machine.
+///
+/// uv is pointed at this executable as the interpreter, so everything it
+/// decides — the tags it resolves against, and the Python that runs a PEP 517
+/// build backend when a dependency ships only an sdist — comes from the
+/// CPython embedded here. Describing the target with `--python-version` alone
+/// would be enough for wheels and needs no interpreter at all, but it leaves
+/// uv to find its own for anything that has to be compiled: it downloads a
+/// second CPython and builds against that one instead of the one that will
+/// run the code.
+fn installEnv(
+    alloc: std.mem.Allocator,
+    cache_root: []const u8,
+    env_dir: []const u8,
+    requirements: []const []const u8,
+) !void {
     const uv = try findUv(alloc, cache_root);
+    const self_path = try std.fs.selfExePathAlloc(alloc);
+    // uv probes the interpreter before resolving, and a build backend needs
+    // the headers. Both want the runtime on disk, which a warm start would
+    // otherwise not have needed yet.
+    try ensureBuildFiles(alloc, try ensureRuntime(alloc, cache_root));
+
     var argv: std.ArrayList([]const u8) = .empty;
     try argv.appendSlice(alloc, &.{
         uv,                  "pip",                         "install",
-        "--quiet",           "--python-version",            build_options.python_version,
+        "--quiet",           "--python",                    self_path,
         "--python-platform", build_options.python_platform, "--target",
         env_dir,
     });
-    try argv.appendSlice(alloc, deps);
+    try argv.appendSlice(alloc, requirements);
+
+    var env = try std.process.getEnvMap(alloc);
+    defer env.deinit();
+    // Lets the interpreter uv spawns recognize the `-c` it is invoked with;
+    // outside this it stays an ordinary argument. See `workerCommandIndex`.
+    try env.put("TAIPAN_PYTHON", "1");
+    // Belt and braces on top of `--python`: no interpreter is fetched,
+    // whatever uv would otherwise decide. Set through the environment rather
+    // than as a flag, because a uv too old to know it ignores an unrecognized
+    // variable but fails on an unrecognized option.
+    try env.put("UV_PYTHON_DOWNLOADS", "never");
 
     const res = try std.process.Child.run(.{
         .allocator = alloc,
         .argv = argv.items,
+        .env_map = &env,
         .max_output_bytes = 16 * 1024 * 1024,
     });
     const ok = switch (res.term) {
@@ -846,11 +1272,8 @@ fn ensureEnv(alloc: std.mem.Allocator, cache_root: []const u8, deps: [][]const u
     };
     if (!ok) {
         std.debug.print("taipan: uv failed:\n{s}\n", .{res.stderr});
-        std.process.exit(1);
+        return error.InstallFailed;
     }
-
-    (try std.fs.cwd().createFile(marker, .{})).close();
-    return .{ .dir = env_dir, .fresh = true };
 }
 
 /// Locate uv: $TAIPAN_UV, then PATH, then the taipan cache — downloading a static
