@@ -109,8 +109,13 @@ cat > "$WORK/frozen.py" <<'EOF'
 import sys
 encs = {n: m.__spec__.origin for n, m in sys.modules.items()
         if n.startswith("encodings")}
-if encs and all(o == "frozen" for o in encs.values()):
+unfrozen = {n: o for n, o in encs.items() if o != "frozen"}
+if encs and not unfrozen:
     print("frozen-ok")
+else:
+    # Name them: the fix is to add them to FREEZE_* in make_payload.py, and
+    # which modules startup imports varies by platform and CPython version.
+    print("startup imports not frozen:", unfrozen or "(no encodings at all)")
 "cp850 codec loads from the zip:".encode("cp850")
 import encodings.idna
 print("zip-codecs-ok")
