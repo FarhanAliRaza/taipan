@@ -1226,7 +1226,8 @@ fn ensureEnv(alloc: std.mem.Allocator, cache_root: []const u8, deps: []const []c
 /// would be enough for wheels and needs no interpreter at all, but it leaves
 /// uv to find its own for anything that has to be compiled: it downloads a
 /// second CPython and builds against that one instead of the one that will
-/// run the code.
+/// run the code. Windows keeps that older behaviour as a fallback, for the
+/// reason given below.
 fn installEnv(
     alloc: std.mem.Allocator,
     cache_root: []const u8,
@@ -1240,25 +1241,66 @@ fn installEnv(
     // otherwise not have needed yet.
     try ensureBuildFiles(alloc, try ensureRuntime(alloc, cache_root));
 
+    const embedded = try runUvInstall(alloc, uv, env_dir, requirements, self_path);
+    if (embedded.ok) return;
+
+    // Windows cannot host a PEP 517 build environment made from this
+    // executable: a venv there is populated by copying a python.exe out of the
+    // base installation, and the runtime has no such file, where POSIX only
+    // has to symlink. Installing wheels needs no venv and works everywhere, so
+    // this is reached only by a dependency that must be compiled. Let uv pick
+    // its own interpreter for that rather than fail — the behaviour taipan had
+    // before it started supplying one.
+    if (!is_windows) return reportUvFailure(embedded.stderr);
+    const uv_chosen = try runUvInstall(alloc, uv, env_dir, requirements, null);
+    if (uv_chosen.ok) return;
+    return reportUvFailure(uv_chosen.stderr);
+}
+
+fn reportUvFailure(stderr: []const u8) error{InstallFailed} {
+    std.debug.print("taipan: uv failed:\n{s}\n", .{stderr});
+    return error.InstallFailed;
+}
+
+const UvResult = struct { ok: bool, stderr: []const u8 };
+
+/// One `uv pip install --target`. With `build_python`, uv uses that executable
+/// as the interpreter — for resolution tags and for running PEP 517 build
+/// hooks — and is forbidden from fetching one; without it, uv resolves against
+/// a described target and chooses its own interpreter for any build.
+fn runUvInstall(
+    alloc: std.mem.Allocator,
+    uv: []const u8,
+    env_dir: []const u8,
+    requirements: []const []const u8,
+    build_python: ?[]const u8,
+) !UvResult {
     var argv: std.ArrayList([]const u8) = .empty;
+    try argv.appendSlice(alloc, &.{ uv, "pip", "install", "--quiet" });
+    if (build_python) |python| {
+        try argv.appendSlice(alloc, &.{ "--python", python });
+    } else {
+        try argv.appendSlice(alloc, &.{ "--python-version", build_options.python_version });
+    }
     try argv.appendSlice(alloc, &.{
-        uv,                  "pip",                         "install",
-        "--quiet",           "--python",                    self_path,
-        "--python-platform", build_options.python_platform, "--target",
-        env_dir,
+        "--python-platform", build_options.python_platform,
+        "--target",          env_dir,
     });
     try argv.appendSlice(alloc, requirements);
 
     var env = try std.process.getEnvMap(alloc);
     defer env.deinit();
-    // Lets the interpreter uv spawns recognize the `-c` it is invoked with;
-    // outside this it stays an ordinary argument. See `workerCommandIndex`.
-    try env.put("TAIPAN_PYTHON", "1");
-    // Belt and braces on top of `--python`: no interpreter is fetched,
-    // whatever uv would otherwise decide. Set through the environment rather
-    // than as a flag, because a uv too old to know it ignores an unrecognized
-    // variable but fails on an unrecognized option.
-    try env.put("UV_PYTHON_DOWNLOADS", "never");
+    if (build_python != null) {
+        // Lets the interpreter uv spawns recognize the `-c` it is invoked
+        // with; outside this it stays an ordinary argument. See
+        // `workerCommandIndex`.
+        try env.put("TAIPAN_PYTHON", "1");
+        // Belt and braces on top of `--python`: no interpreter is fetched,
+        // whatever uv would otherwise decide. Set through the environment
+        // rather than as a flag, because a uv too old to know it ignores an
+        // unrecognized variable but fails on an unrecognized option.
+        try env.put("UV_PYTHON_DOWNLOADS", "never");
+    }
 
     const res = try std.process.Child.run(.{
         .allocator = alloc,
@@ -1266,14 +1308,13 @@ fn installEnv(
         .env_map = &env,
         .max_output_bytes = 16 * 1024 * 1024,
     });
-    const ok = switch (res.term) {
-        .Exited => |code| code == 0,
-        else => false,
+    return .{
+        .ok = switch (res.term) {
+            .Exited => |code| code == 0,
+            else => false,
+        },
+        .stderr = res.stderr,
     };
-    if (!ok) {
-        std.debug.print("taipan: uv failed:\n{s}\n", .{res.stderr});
-        return error.InstallFailed;
-    }
 }
 
 /// Locate uv: $TAIPAN_UV, then PATH, then the taipan cache — downloading a static
