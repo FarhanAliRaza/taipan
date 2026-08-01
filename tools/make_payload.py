@@ -28,7 +28,7 @@ import zipfile
 # Not needed at script runtime (or unusable from a zip): trims ~60% of size.
 STDLIB_EXCLUDES = [
     "test", "idlelib", "tkinter", "turtledemo", "ensurepip", "venv",
-    "config-3.13*", "lib-dynload", "site-packages", "__pycache__", "turtle.py",
+    "config-3.*", "lib-dynload", "site-packages", "__pycache__", "turtle.py",
 ]
 
 # Windows DLLs/ entries we drop: debug info, CPython self-test modules, tk.
@@ -46,7 +46,13 @@ FREEZE_COMMON = [
     "encodings.ascii", "encodings.latin_1",
 ]
 # Windows stdio can fall back to the ANSI/OEM code pages when redirected.
-FREEZE_WINDOWS = ["encodings.cp1252", "encodings.cp437", "encodings.mbcs", "encodings.oem"]
+# encodings/__init__.py imports _win_cp_codecs at the bottom under win32, so it
+# lands on the startup path too — new in 3.14, and the reason to check this
+# list against a new CPython rather than assume it carries over.
+FREEZE_WINDOWS = [
+    "encodings.cp1252", "encodings.cp437", "encodings.mbcs", "encodings.oem",
+    "encodings._win_cp_codecs",
+]
 
 # Frozen packages start with an empty __path__, which would break the
 # dynamic `import encodings.<codec>` done at codec lookup — including the
@@ -124,6 +130,15 @@ def patch_sysconfigdata(lib):
         break
 
 
+def python_dirname(parent):
+    """The `python3.X` directory under `parent`, for whichever CPython is
+    vendored — so a version bump touches only tools/fetch_toolchain.sh."""
+    names = [n for n in os.listdir(parent) if fnmatch.fnmatch(n, "python3.*")]
+    if len(names) != 1:
+        sys.exit(f"expected one python3.* directory in {parent}, found {names}")
+    return names[0]
+
+
 def build_include_tar(vendor, plat, out):
     """The CPython headers, at the path sysconfig reports for this platform.
 
@@ -136,7 +151,8 @@ def build_include_tar(vendor, plat, out):
     if plat == "windows":
         src, arcname = os.path.join(vendor, "include"), "Include"
     else:
-        src, arcname = os.path.join(vendor, "include", "python3.13"), "include/python3.13"
+        name = python_dirname(os.path.join(vendor, "include"))
+        src, arcname = os.path.join(vendor, "include", name), f"include/{name}"
 
     def normalize(ti):
         ti.mtime = 0
@@ -224,7 +240,7 @@ def build_extra_tar(vendor, plat, out):
 def main():
     vendor, plat, out_zip, out_tar, out_frozen, out_include = sys.argv[1:7]
     src = os.path.join(vendor, "Lib") if plat == "windows" else \
-        os.path.join(vendor, "lib", "python3.13")
+        os.path.join(vendor, "lib", python_dirname(os.path.join(vendor, "lib")))
     build_stdlib_zip(src, out_zip)
     build_extra_tar(vendor, plat, out_tar)
     build_frozen_c(src, plat, out_frozen)
