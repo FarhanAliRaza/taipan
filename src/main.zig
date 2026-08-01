@@ -1083,7 +1083,28 @@ fn ensureBuildFiles(alloc: std.mem.Allocator, rt: Runtime) !void {
     defer dest.close();
     try tarx.extractGzip(alloc, dest, include_tar_gz);
     try linkLibPython(alloc, dir);
+    try copyLauncherAsPython(alloc, dir);
     (try std.fs.cwd().createFile(marker, .{})).close();
+}
+
+/// Windows builds a virtual environment by copying a `python.exe` out of the
+/// base installation, where POSIX symlinks whatever `sys._base_executable`
+/// names. The runtime has no such file — the launcher is the interpreter — so
+/// leave a copy of it under the name uv insists on. The shim points
+/// sys._base_executable here; running it is running taipan, which recognizes
+/// the venv it lands in from argv[0].
+fn copyLauncherAsPython(alloc: std.mem.Allocator, runtime_dir: []const u8) !void {
+    if (!is_windows) return;
+
+    const self_path = try std.fs.selfExePathAlloc(alloc);
+    const dest = try std.fmt.allocPrint(alloc, "{s}/python.exe", .{runtime_dir});
+    const pid = std.os.windows.GetCurrentProcessId();
+    const tmp = try std.fmt.allocPrint(alloc, "{s}.tmp.{d}", .{ dest, pid });
+    try std.fs.copyFileAbsolute(self_path, tmp, .{});
+    std.fs.renameAbsolute(tmp, dest) catch |err| {
+        std.fs.deleteFileAbsolute(tmp) catch {};
+        return err;
+    };
 }
 
 /// The runtime keeps libpython at its root under the versioned name the
@@ -1244,14 +1265,17 @@ fn installEnv(
     const embedded = try runUvInstall(alloc, uv, env_dir, requirements, self_path);
     if (embedded.ok) return;
 
-    // Windows cannot host a PEP 517 build environment made from this
-    // executable: a venv there is populated by copying a python.exe out of the
-    // base installation, and the runtime has no such file, where POSIX only
-    // has to symlink. Installing wheels needs no venv and works everywhere, so
-    // this is reached only by a dependency that must be compiled. Let uv pick
-    // its own interpreter for that rather than fail — the behaviour taipan had
-    // before it started supplying one.
+    // Building a source distribution needs a PEP 517 environment, which on
+    // Windows is populated by copying the base interpreter's python.exe.
+    // `copyLauncherAsPython` leaves one for uv to find, but if that is still
+    // not enough, letting uv choose its own interpreter beats failing — it is
+    // what taipan did before it started supplying one. Say so, because it
+    // gives up the guarantee that no second interpreter is ever fetched.
     if (!is_windows) return reportUvFailure(embedded.stderr);
+    std.debug.print(
+        "taipan: cannot build from source against the embedded interpreter here; letting uv choose one\n",
+        .{},
+    );
     const uv_chosen = try runUvInstall(alloc, uv, env_dir, requirements, null);
     if (uv_chosen.ok) return;
     return reportUvFailure(uv_chosen.stderr);
