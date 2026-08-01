@@ -291,10 +291,14 @@ out="$("$TAIPAN" build examples/greeter -e greet -o "$WORK/shipped/greet" 2>&1)"
 echo "$out" | grep -q "entry point greet -> greeter.cli:main"
 check "package build resolves the named console script" $? "$out"
 
-# A local project is built through PEP 517, so this is the one test that puts
-# a build backend on the embedded interpreter on every platform.
-! echo "$out" | grep -q "letting uv choose"
-check "package build runs its build backend on the embedded interpreter" $? "$out"
+# A local project is built through PEP 517, so this is the case that puts a
+# build backend on the embedded interpreter. Windows cannot: a virtualenv
+# there is made by copying a python.exe the runtime does not have, so it falls
+# back to an interpreter uv picks.
+if [ -z "$WIN" ]; then
+    ! echo "$out" | grep -q "letting uv choose"
+    check "package build runs its build backend on the embedded interpreter" $? "$out"
+fi
 
 out="$("$WORK/shipped/greet" taipan 2>&1)"
 echo "$out" | grep -q "hello, taipan"

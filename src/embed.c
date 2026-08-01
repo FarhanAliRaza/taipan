@@ -210,20 +210,11 @@ int taipan_run_file(const char *executable_path, const char *stdlib_path,
         }
     }
 
-    /* A virtual environment on Windows is created by copying the base
-     * interpreter's python.exe, so uv refuses a base executable that is not
-     * one — without this it cannot build a source distribution against us at
-     * all. `ensureBuildFiles` keeps a copy of the launcher under that name in
-     * the runtime dir; point sys._base_executable at it. Elsewhere CPython
-     * already defaults this to config.executable, which uv can symlink. */
-    if (runtime_dir[0] != '\0') {
-        char base_exe[4096];
-        int n = snprintf(base_exe, sizeof base_exe, "%s/python.exe", runtime_dir);
-        if (n > 0 && (size_t)n < sizeof base_exe) {
-            status = PyConfig_SetBytesString(&config, &config.base_executable, base_exe);
-            if (PyStatus_Exception(status)) goto fail;
-        }
-    }
+    /* sys._base_executable is deliberately left as config.executable: on
+     * Windows multiprocessing spawns *that* (see multiprocessing/spawn.py),
+     * so pointing it anywhere the launcher is not breaks every spawned
+     * worker. It also means uv cannot copy a python.exe out of it to build a
+     * virtualenv — see installEnv. */
 #endif
 
     for (int i = 0; i < extra_path_count; i++) {
