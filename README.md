@@ -4,7 +4,7 @@
 
 Run Python scripts anywhere. No Python required.
 
-taipan is a single ~31 MB executable with CPython 3.13 inside. It runs Python
+taipan is a single ~31 MB executable with CPython 3.14 inside. It runs Python
 files — including [PEP 723](https://peps.python.org/pep-0723/) scripts with
 inline dependencies — on machines with nothing installed, and compiles
 scripts into standalone executables.
@@ -71,11 +71,11 @@ needs `curl` and `tar`). Scripts without dependencies never touch uv.
 
 uv uses the embedded interpreter, so it never downloads a Python of its own.
 This includes dependencies that publish no wheel: they are compiled from
-source against the same CPython 3.13 that runs your code, and need a C
+source against the same CPython 3.14 that runs your code, and need a C
 compiler (`cc`, or MSVC on Windows).
 
 The exception is on Windows, where a package that embeds Python needs
-`python313.lib`, an import library taipan does not ship. For those builds uv
+`python314.lib`, an import library taipan does not ship. For those builds uv
 falls back to its own interpreter and downloads one if it finds none. taipan
 tells you when this happens.
 
@@ -137,7 +137,7 @@ cached environment, so pin the version if you want rebuilds to fetch nothing.
 
 ## How it works
 
-The binary embeds a stripped CPython 3.13 and a bytecode-compiled standard
+The binary embeds a stripped CPython 3.14 and a bytecode-compiled standard
 library, extracted to a local cache on first use. Dependencies are installed
 by uv into content-addressed environments and precompiled once. Script
 bytecode is cached and startup modules are frozen into the runtime, so a warm

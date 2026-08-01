@@ -9,39 +9,39 @@ cd "$(dirname "$0")/.."
 ZIG_VERSION=0.15.2
 ZIG_EXT=tar.xz
 PBS_TAG=20260623
-PBS_VERSION=3.13.14
+PBS_VERSION=3.14.6
 
 case "$(uname -s)-$(uname -m)" in
 Linux-x86_64)
     ZIG_PLAT=x86_64-linux
     ZIG_SHA256=02aa270f183da276e5b5920b1dac44a63f1a49e55050ebde3aecc9eb82f93239
     PBS_PLAT=x86_64-unknown-linux-gnu
-    PBS_SHA256=7fd02919461b368adafea3896ad082f5c4f759816d69681dcc6559bfbcd892af
+    PBS_SHA256=3d943d8b4360823959012d7e9f4c755256ac1e9c04b609c24894a1b480736e36
     ;;
 Linux-aarch64)
     ZIG_PLAT=aarch64-linux
     ZIG_SHA256=958ed7d1e00d0ea76590d27666efbf7a932281b3d7ba0c6b01b0ff26498f667f
     PBS_PLAT=aarch64-unknown-linux-gnu
-    PBS_SHA256=1199b22c83725a339ebaef36d39476d037fb7267187513090b6cc83bb4579477
+    PBS_SHA256=93af46aac9d7c210b4842ab2813a2ac6e0af60d2550b3ca5f761f2e0f5e18b64
     ;;
 Darwin-arm64)
     ZIG_PLAT=aarch64-macos
     ZIG_SHA256=3cc2bab367e185cdfb27501c4b30b1b0653c28d9f73df8dc91488e66ece5fa6b
     PBS_PLAT=aarch64-apple-darwin
-    PBS_SHA256=804c86c8665b18eb0df5070a79d828229018d145baea38a71a5c74c03f9b11d4
+    PBS_SHA256=44f31db9afd16f714194580f2362e66d8b1784bf3a3e2d0ac86e7b392f32d75b
     ;;
 Darwin-x86_64)
     ZIG_PLAT=x86_64-macos
     ZIG_SHA256=375b6909fc1495d16fc2c7db9538f707456bfc3373b14ee83fdd3e22b3d43f7f
     PBS_PLAT=x86_64-apple-darwin
-    PBS_SHA256=cd0023fb84de358d285c8e116cffd2f433086b943e752955dade521c12e78cab
+    PBS_SHA256=ad7e98f99975051ac4831c7062e6446b4fa21d04bfe112f3b60ef279dab4f4c5
     ;;
 MINGW*-x86_64 | MSYS*-x86_64)
     ZIG_PLAT=x86_64-windows
     ZIG_EXT=zip
     ZIG_SHA256=3a0ed1e8799a2f8ce2a6e6290a9ff22e6906f8227865911fb7ddedc3cc14cb0c
     PBS_PLAT=x86_64-pc-windows-msvc
-    PBS_SHA256=646254b53fbac69c1b3c25131c237c9136e9bbed7444123880cea8deaf555e1f
+    PBS_SHA256=50ca267042ac875f13ea9191799a9ff57b08154dc60a261424f66996f4d5a651
     ;;
 *)
     echo "unsupported build platform: $(uname -s)-$(uname -m)" >&2

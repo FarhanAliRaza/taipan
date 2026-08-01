@@ -15,6 +15,12 @@ WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 export TAIPAN_CACHE="$WORK/cache"
 
+# The CPython the binary is expected to embed. Asserted rather than derived, so
+# an unintended interpreter change fails here. Keep in step with build.zig.
+PY_VERSION=3.14
+PY_FULL=3.14.6
+PY_NODOT=314
+
 pass=0
 fail=0
 
@@ -32,7 +38,7 @@ check() { # name condition-exit-code [output-to-show-on-failure]
 
 # --- basics -----------------------------------------------------------------
 out="$("$TAIPAN" examples/hello.py a b 2>&1)"
-echo "$out" | grep -q "hello from taipan on 3.13.14" && \
+echo "$out" | grep -q "hello from taipan on $PY_FULL" && \
     echo "$out" | grep -qF "argv: ['examples/hello.py', 'a', 'b']"
 check "hello: output and sys.argv" $?
 
@@ -41,7 +47,7 @@ check "run subcommand accepted" $?
 
 # --- runtime extraction -----------------------------------------------------
 test -f "$TAIPAN_CACHE"/runtime/*/stdlib.zip && \
-    ls "$TAIPAN_CACHE"/runtime/*/ | grep -qE 'libpython3\.13|python313\.dll' && \
+    ls "$TAIPAN_CACHE"/runtime/*/ | grep -qF -e "libpython$PY_VERSION" -e "python$PY_NODOT.dll" && \
     test -f "$TAIPAN_CACHE"/runtime/*/.taipan-ok
 check "runtime extracted into TAIPAN_CACHE" $?
 
@@ -135,7 +141,7 @@ check "compiled extension wheel loads" $? "$compiled"
 # --- source-only dependencies ------------------------------------------------
 # crcmod publishes no wheels, so its C extension has to be compiled. Left to
 # itself uv downloads an interpreter to do that; taipan hands it the embedded
-# one, which is also the one that will run the result — hence the cpython-313
+# one, which is also the one that will run the result — hence the cpython-314
 # tag on what comes out. Skipped on Windows, where the compiler lives behind a
 # developer prompt the test harness does not enter.
 if [ -z "$WIN" ]; then
@@ -148,15 +154,15 @@ print("built extension:", ext.__file__)
 PY
     mkdir -p "$WORK/uvpy"
     sdist="$(UV_PYTHON_INSTALL_DIR="$WORK/uvpy" "$TAIPAN" run "$WORK/sdist_dep.py" 2>&1)"
-    echo "$sdist" | grep -q "built extension:" && echo "$sdist" | grep -q "cpython-313"
+    echo "$sdist" | grep -q "built extension:" && echo "$sdist" | grep -q "cpython-$PY_NODOT"
     check "source-only dependency compiles against the embedded interpreter" $? "$sdist"
 
     # The point of the exercise: uv's interpreter dir stays empty.
     [ -z "$(ls -A "$WORK/uvpy")" ]
     check "building it downloads no interpreter" $?
 
-    test -f "$TAIPAN_CACHE"/runtime/*/include/python3.13/Python.h && \
-        test -e "$TAIPAN_CACHE"/runtime/*/lib/libpython3.13.*
+    test -f "$TAIPAN_CACHE"/runtime/*/include/python$PY_VERSION/Python.h && \
+        test -e "$TAIPAN_CACHE"/runtime/*/lib/libpython$PY_VERSION.*
     check "headers and a linkable libpython unpacked for the build" $?
 fi
 
