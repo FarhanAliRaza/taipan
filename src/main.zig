@@ -1114,14 +1114,14 @@ fn installVenvShims(alloc: std.mem.Allocator, runtime_dir: []const u8) !void {
 }
 
 /// The runtime keeps libpython at its root under the versioned name the
-/// dynamic loader wants (`libpython3.13.so.1.0`). A linker asked for
-/// `-lpython3.13` looks for the development name instead, in the `lib` dir
+/// dynamic loader wants (`libpython3.14.so.1.0`). A linker asked for
+/// `-lpython3.14` looks for the development name instead, in the `lib` dir
 /// that sysconfig advertises as LIBDIR — so put one there pointing back.
 /// Extension modules need none of this: on Linux and macOS they deliberately
 /// don't link libpython and resolve Py* symbols from the loaded interpreter.
 /// Packages that *embed* Python (uWSGI is the common one) do link it.
 fn linkLibPython(alloc: std.mem.Allocator, runtime_dir: []const u8) !void {
-    // Windows links against python313.lib, an import library the runtime does
+    // Windows links against python314.lib, an import library the runtime does
     // not carry; an embedding build there needs a real CPython install.
     if (is_windows) return;
 
@@ -1164,7 +1164,7 @@ fn loadShimInner(alloc: std.mem.Allocator, rt: Runtime) !RunFileFn {
     if (is_windows) {
         // LoadLibrary world: dependencies resolve by base name against the
         // already-loaded module list, so preload everything the shim and any
-        // wheel .pyd may import — the vcruntimes, python313.dll, and the
+        // wheel .pyd may import — the vcruntimes, python314.dll, and the
         // stable-ABI forwarder python3.dll (abi3 wheels link against it).
         const dir = std.fs.path.dirname(rt.shim).?;
         const preload = [_][]const u8{ "vcruntime140.dll", "vcruntime140_1.dll", "python3.dll" };
@@ -1272,7 +1272,7 @@ fn installEnv(
     if (embedded.ok) return;
 
     // Windows is where building from source is most likely to want something
-    // the runtime cannot offer — an embedding build needs python313.lib, an
+    // the runtime cannot offer — an embedding build needs python314.lib, an
     // import library it does not carry. Rather than fail, fall back to what
     // taipan did before it supplied an interpreter at all and let uv choose
     // one. Say so: it gives up the guarantee that no second interpreter is
