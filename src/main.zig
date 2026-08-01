@@ -1083,7 +1083,34 @@ fn ensureBuildFiles(alloc: std.mem.Allocator, rt: Runtime) !void {
     defer dest.close();
     try tarx.extractGzip(alloc, dest, include_tar_gz);
     try linkLibPython(alloc, dir);
+    try installVenvShims(alloc, dir);
     (try std.fs.cwd().createFile(marker, .{})).close();
+}
+
+/// A PEP 517 build needs a virtual environment, and on Windows uv builds one
+/// by *copying* an executable rather than symlinking it. It looks for that
+/// executable in four places, the first being CPython's own venv shim
+/// directory under the stdlib path sysconfig reports — so put a copy of the
+/// launcher there. The launcher is the interpreter, so a copy of it is exactly
+/// what belongs in `<venv>/Scripts`: run from there it finds the environment
+/// from its own argv[0], the same way the symlink does on POSIX.
+///
+/// The remaining three places all sit next to `sys._base_executable`, which is
+/// why the obvious fix — point that at a stand-in — is the wrong one: on
+/// Windows multiprocessing spawns exactly that executable.
+fn installVenvShims(alloc: std.mem.Allocator, runtime_dir: []const u8) !void {
+    // POSIX venvs symlink the base executable; there is nothing to copy.
+    if (!is_windows) return;
+
+    const dir = try std.fmt.allocPrint(alloc, "{s}/Lib/venv/scripts/nt", .{runtime_dir});
+    try std.fs.cwd().makePath(dir);
+    const self_path = try std.fs.selfExePathAlloc(alloc);
+    // uv copies pythonw.exe alongside python.exe and fails if either is
+    // missing. Nothing ever runs the windowed one.
+    for ([_][]const u8{ "python.exe", "pythonw.exe" }) |name| {
+        const shim = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ dir, name });
+        try std.fs.cwd().copyFile(self_path, std.fs.cwd(), shim, .{});
+    }
 }
 
 /// The runtime keeps libpython at its root under the versioned name the
@@ -1244,14 +1271,12 @@ fn installEnv(
     const embedded = try runUvInstall(alloc, uv, env_dir, requirements, self_path);
     if (embedded.ok) return;
 
-    // Building a source distribution needs a PEP 517 environment, which on
-    // Windows is populated by copying the base interpreter's python.exe. The
-    // runtime has no such file — the launcher is the interpreter — and
-    // sys._base_executable cannot be pointed at a stand-in, because
-    // multiprocessing spawns exactly that on Windows. So let uv choose its own
-    // interpreter rather than fail, which is what taipan did before it
-    // supplied one. Say so: it gives up the guarantee that no second
-    // interpreter is ever fetched.
+    // Windows is where building from source is most likely to want something
+    // the runtime cannot offer — an embedding build needs python313.lib, an
+    // import library it does not carry. Rather than fail, fall back to what
+    // taipan did before it supplied an interpreter at all and let uv choose
+    // one. Say so: it gives up the guarantee that no second interpreter is
+    // ever fetched.
     if (!is_windows) return reportUvFailure(embedded.stderr);
     std.debug.print(
         "taipan: cannot build from source against the embedded interpreter here; letting uv choose one\n",
