@@ -46,7 +46,13 @@ FREEZE_COMMON = [
     "encodings.ascii", "encodings.latin_1",
 ]
 # Windows stdio can fall back to the ANSI/OEM code pages when redirected.
-FREEZE_WINDOWS = ["encodings.cp1252", "encodings.cp437", "encodings.mbcs", "encodings.oem"]
+# encodings/__init__.py imports _win_cp_codecs at the bottom under win32, so it
+# lands on the startup path too — new in 3.14, and the reason to check this
+# list against a new CPython rather than assume it carries over.
+FREEZE_WINDOWS = [
+    "encodings.cp1252", "encodings.cp437", "encodings.mbcs", "encodings.oem",
+    "encodings._win_cp_codecs",
+]
 
 # Frozen packages start with an empty __path__, which would break the
 # dynamic `import encodings.<codec>` done at codec lookup — including the
