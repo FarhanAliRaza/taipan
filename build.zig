@@ -32,6 +32,7 @@ pub fn build(b: *std.Build) void {
     const stdlib_zip = payload.addOutputFileArg("stdlib.zip");
     const extra_tar = payload.addOutputFileArg("extra.tar");
     const frozen_c = payload.addOutputFileArg("taipan_frozen.c");
+    const include_tar_gz = payload.addOutputFileArg("include.tar.gz");
 
     // The C shim (all Python.h usage) as a shared library. It is embedded in
     // the exe, extracted to the runtime cache next to libpython, and loaded
@@ -93,13 +94,14 @@ pub fn build(b: *std.Build) void {
     mod.addAnonymousImport("libpython_so", .{ .root_source_file = libpython_blob });
     mod.addAnonymousImport("shim_so", .{ .root_source_file = shim.getEmittedBin() });
     mod.addAnonymousImport("extra_tar", .{ .root_source_file = extra_tar });
+    mod.addAnonymousImport("include_tar_gz", .{ .root_source_file = include_tar_gz });
 
     const exe = b.addExecutable(.{ .name = "taipan", .root_module = mod });
     b.installArtifact(exe);
 
     // `zig build test` — unit tests for the pure-Zig parts (no Python needed).
     const test_step = b.step("test", "Run unit tests");
-    for ([_][]const u8{ "src/pep723.zig", "src/tarx.zig" }) |root| {
+    for ([_][]const u8{ "src/pep723.zig", "src/tarx.zig", "src/entrypoints.zig" }) |root| {
         const unit_tests = b.addTest(.{
             .root_module = b.createModule(.{
                 .root_source_file = b.path(root),

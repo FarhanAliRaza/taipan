@@ -16,8 +16,8 @@ scripts into standalone executables.
   [uv](https://github.com/astral-sh/uv) and cached; one install per
   dependency set, ever.
 - **~10 ms warm starts** — [about 3× faster](./BENCHMARKS.md) than `uv run`.
-- **Standalone executables** — `taipan build` bundles a script and its
-  dependencies into one file that runs offline.
+- **Standalone executables** — `taipan build` bundles a script, or a whole
+  package and its console script, into one file that runs offline.
 - Supports Linux, macOS, and Windows.
 
 ## Installation
@@ -69,6 +69,16 @@ Installs are delegated to uv, found via `$TAIPAN_UV`, then `PATH`; if
 neither exists, taipan downloads a static copy into its cache once (this
 needs `curl` and `tar`). Scripts without dependencies never touch uv.
 
+uv uses the embedded interpreter, so it never downloads a Python of its own.
+This includes dependencies that publish no wheel: they are compiled from
+source against the same CPython 3.13 that runs your code, and need a C
+compiler (`cc`, or MSVC on Windows).
+
+The exception is on Windows, where a package that embeds Python needs
+`python313.lib`, an import library taipan does not ship. For those builds uv
+falls back to its own interpreter and downloads one if it finds none. taipan
+tells you when this happens.
+
 ### Standalone executables
 
 Bundle a script, the interpreter, and its dependencies into one file:
@@ -97,6 +107,34 @@ file or directory) keep their basename next to the script; read them with
 `Path(__file__).with_name("settings.json")`. Duplicate paths warn at build
 time, and the last copy wins.
 
+### Building a package
+
+`taipan build` also accepts a project directory or any requirement uv
+understands. taipan installs the package with its dependencies, and the
+executable runs one of its console scripts:
+
+```sh
+taipan build ./omniload -e omniload -o omniload   # from a local project
+taipan build 'omniload==0.7.0' -e omniload        # from a package registry
+```
+
+Use `-e` to name the console script, the same name `pip install` would put on
+your `PATH`. Omit it if the package declares exactly one; if it declares
+several, taipan lists them and asks. Only `console_scripts` entry points are
+considered, not `gui_scripts`.
+
+If no console script does what you want, `-e` also accepts an import target:
+
+```sh
+taipan build ./omniload -e omniload.main:main
+```
+
+The output name defaults to the console script's name.
+
+A local project is reinstalled on every build, since its contents may have
+changed; uv's cache keeps this cheap. A pinned requirement reuses taipan's
+cached environment, so pin the version if you want rebuilds to fetch nothing.
+
 ## How it works
 
 The binary embeds a stripped CPython 3.13 and a bytecode-compiled standard
@@ -106,11 +144,12 @@ bytecode is cached and startup modules are frozen into the runtime, so a warm
 start does almost no work. Threads and every `multiprocessing` start method
 are supported.
 
-`taipan build` appends the script and its installed environment to a copy of
-the launcher, sealed with a digest that serves as both integrity check and
-cache key. On the target, the first launch verifies and extracts the payload;
-later launches read only the 64-byte footer. A truncated or modified
-executable fails with a clear error.
+`taipan build` appends the entry script and its installed environment to a
+copy of the launcher, sealed with a digest that serves as both integrity
+check and cache key. For a package build, taipan generates the entry script.
+On the target, the first launch verifies and extracts the payload; later
+launches read only the 64-byte footer. A truncated or modified executable
+fails with a clear error.
 
 The cache lives at `~/.cache/taipan` (`%LOCALAPPDATA%\taipan` on Windows) and
 is disposable — deleting it costs one re-extraction on the next run. Set
@@ -130,14 +169,18 @@ where that assumption breaks:
 - `taipan build` produces one executable that needs nothing on the target.
   uv has no equivalent.
 
-taipan is not a project manager. For lockfiles, multiple Python versions, or
-anything with a `pyproject.toml`, use uv.
+taipan is not a project manager. For lockfiles, multiple Python versions, and
+day-to-day work inside a project, use uv.
 
 ## Limitations
 
 - Linux builds require glibc; musl (Alpine) is not supported yet.
 - Dependency sets are not locked — the first resolution wins and is cached.
   Pin versions in the PEP 723 block (`"httpx==0.28.1"`) for reproducibility.
+- A dependency with no wheel is compiled against the build machine's system
+  libraries, so the executable only runs on systems at least as new as the one
+  that built it. Wheels from PyPI target manylinux and carry no such
+  restriction.
 - Standard-library tracebacks show file and line but not source text, and
   code that expects stdlib modules to exist as ordinary files may fail.
   `tkinter`, `idlelib`, `venv`, and `ensurepip` are not included.

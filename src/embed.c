@@ -122,8 +122,8 @@ static int exec_module_code(PyObject *code, const char *script_path) {
 }
 
 int taipan_run_file(const char *executable_path, const char *stdlib_path,
-                 const char *extra_sys_path,
-                 int precompile_extra, const char *script_path,
+                 const char *const *extra_paths, int extra_path_count,
+                 const char *precompile_dir, const char *script_path,
                  const char *script_source, const char *pyc_path,
                  int argc, char **argv) {
     PyStatus status;
@@ -149,12 +149,14 @@ int taipan_run_file(const char *executable_path, const char *stdlib_path,
     /* multiprocessing re-execs sys.executable for trackers and spawned
      * workers. Mark descendants so the launcher recognizes that private -c
      * protocol, and carry the dependency path across the exec boundary. */
+    const char *child_path =
+        (extra_path_count > 0 && extra_paths[0]) ? extra_paths[0] : "";
 #ifdef MS_WINDOWS
     _putenv_s("TAIPAN_CHILD", "1");
-    _putenv_s("TAIPAN_CHILD_PATH", extra_sys_path ? extra_sys_path : "");
+    _putenv_s("TAIPAN_CHILD_PATH", child_path);
 #else
     setenv("TAIPAN_CHILD", "1", 1);
-    setenv("TAIPAN_CHILD_PATH", extra_sys_path ? extra_sys_path : "", 1);
+    setenv("TAIPAN_CHILD_PATH", child_path, 1);
 #endif
 
     /* No config.home, no path probing: sys.path is exactly what we say. */
@@ -162,27 +164,63 @@ int taipan_run_file(const char *executable_path, const char *stdlib_path,
     status = add_search_path(&config.module_search_paths, stdlib_path);
     if (PyStatus_Exception(status)) goto fail;
 
+    /* The runtime cache dir — stdlib.zip's parent. Paths from the Zig side
+     * always use '/', including on Windows. */
+    char runtime_dir[4096];
+    runtime_dir[0] = '\0';
+    {
+        const char *slash = strrchr(stdlib_path, '/');
+        if (slash != NULL) {
+            int n = snprintf(runtime_dir, sizeof runtime_dir, "%.*s",
+                             (int)(slash - stdlib_path), stdlib_path);
+            if (n < 0 || (size_t)n >= sizeof runtime_dir)
+                runtime_dir[0] = '\0';
+        }
+    }
+
+    /* Point the install prefixes at the runtime dir. Nothing here re-enables
+     * path probing (module_search_paths_set is already 1); the effect is on
+     * sysconfig, which derives its scheme paths from sys.prefix and would
+     * otherwise report python-build-standalone's baked-in "/install" — a
+     * path that exists on no machine. Build backends read
+     * sysconfig.get_paths()["include"] to find Python.h, so this is what
+     * makes the embedded interpreter usable for building sdists. */
+    if (runtime_dir[0] != '\0') {
+        status = PyConfig_SetBytesString(&config, &config.prefix, runtime_dir);
+        if (PyStatus_Exception(status)) goto fail;
+        status = PyConfig_SetBytesString(&config, &config.exec_prefix, runtime_dir);
+        if (PyStatus_Exception(status)) goto fail;
+        status = PyConfig_SetBytesString(&config, &config.base_prefix, runtime_dir);
+        if (PyStatus_Exception(status)) goto fail;
+        status = PyConfig_SetBytesString(&config, &config.base_exec_prefix, runtime_dir);
+        if (PyStatus_Exception(status)) goto fail;
+    }
+
 #ifdef MS_WINDOWS
     /* On Windows the stdlib C extensions are separate .pyd files, extracted
      * to a DLLs/ dir next to stdlib.zip. Their support DLLs (OpenSSL,
      * sqlite3, libffi) sit beside them and resolve via the loader's
-     * DLL-load-dir search. Paths from the Zig side always use '/'. */
-    {
-        const char *slash = strrchr(stdlib_path, '/');
-        if (slash != NULL) {
-            char dlls_dir[4096];
-            int n = snprintf(dlls_dir, sizeof dlls_dir, "%.*s/DLLs",
-                             (int)(slash - stdlib_path), stdlib_path);
-            if (n > 0 && (size_t)n < sizeof dlls_dir) {
-                status = add_search_path(&config.module_search_paths, dlls_dir);
-                if (PyStatus_Exception(status)) goto fail;
-            }
+     * DLL-load-dir search. */
+    if (runtime_dir[0] != '\0') {
+        char dlls_dir[4096];
+        int n = snprintf(dlls_dir, sizeof dlls_dir, "%s/DLLs", runtime_dir);
+        if (n > 0 && (size_t)n < sizeof dlls_dir) {
+            status = add_search_path(&config.module_search_paths, dlls_dir);
+            if (PyStatus_Exception(status)) goto fail;
         }
     }
+
+    /* sys._base_executable is deliberately left as config.executable: on
+     * Windows multiprocessing spawns *that* (see multiprocessing/spawn.py),
+     * so pointing it anywhere the launcher is not breaks every spawned
+     * worker. It also means uv cannot copy a python.exe out of it to build a
+     * virtualenv — see installEnv. */
 #endif
 
-    if (extra_sys_path && extra_sys_path[0]) {
-        status = add_search_path(&config.module_search_paths, extra_sys_path);
+    for (int i = 0; i < extra_path_count; i++) {
+        if (extra_paths[i] == NULL || extra_paths[i][0] == '\0')
+            continue;
+        status = add_search_path(&config.module_search_paths, extra_paths[i]);
         if (PyStatus_Exception(status)) goto fail;
     }
 
@@ -195,12 +233,12 @@ int taipan_run_file(const char *executable_path, const char *stdlib_path,
 
     /* One-time bytecode precompile of a fresh dependency env, in-process so
      * no external python is ever needed. Failure only costs speed. */
-    if (precompile_extra && extra_sys_path && extra_sys_path[0]) {
+    if (precompile_dir && precompile_dir[0]) {
         char buf[4200];
         int n = snprintf(buf, sizeof buf,
                          "import compileall\n"
                          "compileall.compile_dir('%s', quiet=2)\n",
-                         extra_sys_path);
+                         precompile_dir);
         if (n > 0 && (size_t)n < sizeof buf && PyRun_SimpleString(buf) != 0)
             PyErr_Clear();
     }

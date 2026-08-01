@@ -115,7 +115,7 @@ check "startup encodings frozen; other codecs from zip" $? "$out"
 
 # --- PEP 723 dependencies -----------------------------------------------------
 cold="$("$TAIPAN" run examples/pure_dep.py 2>&1)"
-echo "$cold" | grep -q "installing 1 dependencies" && \
+echo "$cold" | grep -q "installing cowsay into cache" && \
     echo "$cold" | grep -q "taipan works with pure-python deps"
 check "PEP 723 cold: installs and runs" $? "$cold"
 
@@ -131,6 +131,34 @@ check "dep env bytecode precompiled" $?
 compiled="$("$TAIPAN" run examples/compiled_dep.py 2>&1)"
 echo "$compiled" | grep -q "WITH C extension"
 check "compiled extension wheel loads" $? "$compiled"
+
+# --- source-only dependencies ------------------------------------------------
+# crcmod publishes no wheels, so its C extension has to be compiled. Left to
+# itself uv downloads an interpreter to do that; taipan hands it the embedded
+# one, which is also the one that will run the result — hence the cpython-313
+# tag on what comes out. Skipped on Windows, where the compiler lives behind a
+# developer prompt the test harness does not enter.
+if [ -z "$WIN" ]; then
+    cat > "$WORK/sdist_dep.py" <<'PY'
+# /// script
+# dependencies = ["crcmod==1.7"]
+# ///
+import crcmod._crcfunext as ext
+print("built extension:", ext.__file__)
+PY
+    mkdir -p "$WORK/uvpy"
+    sdist="$(UV_PYTHON_INSTALL_DIR="$WORK/uvpy" "$TAIPAN" run "$WORK/sdist_dep.py" 2>&1)"
+    echo "$sdist" | grep -q "built extension:" && echo "$sdist" | grep -q "cpython-313"
+    check "source-only dependency compiles against the embedded interpreter" $? "$sdist"
+
+    # The point of the exercise: uv's interpreter dir stays empty.
+    [ -z "$(ls -A "$WORK/uvpy")" ]
+    check "building it downloads no interpreter" $?
+
+    test -f "$TAIPAN_CACHE"/runtime/*/include/python3.13/Python.h && \
+        test -e "$TAIPAN_CACHE"/runtime/*/lib/libpython3.13.*
+    check "headers and a linkable libpython unpacked for the build" $?
+fi
 
 # --- standalone builds -------------------------------------------------------
 "$TAIPAN" build examples/hello.py -o "$WORK/hello-built" >/dev/null 2>&1 && \
@@ -241,6 +269,84 @@ out="$("$TAIPAN" build "$WORK/collide/app.py" --include-local \
     --include "$WORK/collide/dup.py" -o "$WORK/collide-built" 2>&1)"
 echo "$out" | grep -q "bundled more than once"
 check "duplicate bundle path warns at build time" $? "$out"
+
+# --- package builds ------------------------------------------------------------
+# examples/greeter declares two console scripts, so an unqualified build can't
+# guess between them.
+out="$("$TAIPAN" build examples/greeter -o "$WORK/ambiguous" 2>&1)"
+echo "$out" | grep -q "choose one with -e" && \
+    echo "$out" | grep -q "greet = greeter.cli:main" && \
+    ! test -e "$WORK/ambiguous"
+check "package build without -e lists the console scripts" $? "$out"
+
+out="$("$TAIPAN" build examples/greeter -e nope -o "$WORK/nope" 2>&1)"; rc=$?
+[ $rc -ne 0 ] && echo "$out" | grep -q "no installed console script is named nope"
+check "package build rejects an unknown -e name" $? "$out"
+
+# A failed build must not leave its scratch environment behind.
+! test -d "$TAIPAN_CACHE/build" || [ -z "$(ls -A "$TAIPAN_CACHE/build")" ]
+check "failed package build cleans up its scratch env" $?
+
+out="$("$TAIPAN" build examples/greeter -e greet -o "$WORK/shipped/greet" 2>&1)"
+echo "$out" | grep -q "entry point greet -> greeter.cli:main"
+check "package build resolves the named console script" $? "$out"
+
+# A local project is built through PEP 517, so this is the case that puts a
+# build backend on the embedded interpreter — on every platform, including the
+# Windows virtualenv that is populated by copying rather than symlinking.
+! echo "$out" | grep -q "letting uv choose"
+check "package build runs its build backend on the embedded interpreter" $? "$out"
+
+out="$("$WORK/shipped/greet" taipan 2>&1)"
+echo "$out" | grep -q "hello, taipan"
+check "built package runs its entry point with its dependencies" $? "$out"
+
+# The generated __main__ calls the entry point the same way a console script
+# wrapper does, so its return value is the exit status.
+"$WORK/shipped/greet" >/dev/null 2>&1; [ $? -eq 0 ]
+check "built package propagates the entry point's return value" $?
+
+# A local directory is reinstalled on every build; an edit must not be served
+# from a stale environment.
+cp -r examples/greeter "$WORK/greeter-edit"
+sed -i.bak 's/HELLO, /GOODBYE, /' "$WORK/greeter-edit/greeter/cli.py" && rm -f "$WORK/greeter-edit/greeter/cli.py.bak"
+"$TAIPAN" build "$WORK/greeter-edit" -e greet-loud -o "$WORK/edited" >/dev/null 2>&1
+out="$("$WORK/edited" world 2>&1)"
+echo "$out" | grep -q "GOODBYE, WORLD!"
+check "package build picks up local source edits" $? "$out"
+
+# -e module:function skips discovery, for packages that declare no console
+# script for what you want to run.
+"$TAIPAN" build "$WORK/greeter-edit" -e greeter.cli:main -o "$WORK/direct" >/dev/null 2>&1
+out="$("$WORK/direct" direct 2>&1)"
+echo "$out" | grep -q "hello, direct"
+check "package build accepts an explicit module:function target" $? "$out"
+
+# A registry requirement takes the cached-environment path instead, and cowsay
+# declares exactly one console script, so -e is unnecessary.
+out="$("$TAIPAN" build cowsay -o "$WORK/shipped/cowsay" 2>&1)"
+echo "$out" | grep -q "entry point cowsay -> cowsay.__main__:cli"
+check "package build from a registry requirement" $? "$out"
+
+out="$("$WORK/shipped/cowsay" -t "shipped from pypi" 2>&1)"
+echo "$out" | grep -q "shipped from pypi"
+check "built registry package runs" $? "$out"
+
+out="$("$TAIPAN" build examples/greeter -e 'not a target:' -o "$WORK/bad" 2>&1)"; rc=$?
+[ $rc -eq 2 ] && echo "$out" | grep -q "not a valid module:function target"
+check "package build rejects a malformed module:function target" $? "$out"
+
+out="$("$TAIPAN" build examples/hello.py -e greet -o "$WORK/mixed" 2>&1)"; rc=$?
+[ $rc -ne 0 ] && echo "$out" | grep -q "\-e applies to package builds"
+check "-e is rejected for script builds" $? "$out"
+
+out="$("$TAIPAN" build examples/greeter --include-local -e greet -o "$WORK/mixed" 2>&1)"; rc=$?
+[ $rc -ne 0 ] && echo "$out" | grep -q "\-\-include-local applies to script builds"
+check "--include-local is rejected for package builds" $? "$out"
+
+out="$("$TAIPAN" build "$WORK/absent.py" -o "$WORK/absent" 2>&1)"; rc=$?
+[ $rc -ne 0 ] && echo "$out" | grep -q "cannot read"
+check "a missing .py path is a script error, not a package spec" $? "$out"
 
 # --- isolation: no python3/uv on PATH ------------------------------------------
 # POSIX-only: on Windows the msys tools can't be meaningfully symlinked into a

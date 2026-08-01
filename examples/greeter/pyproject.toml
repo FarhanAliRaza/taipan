@@ -1,0 +1,16 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "greeter"
+version = "0.1.0"
+description = "Example package for `taipan build <directory>`."
+requires-python = ">=3.12"
+dependencies = ["cowsay"]
+
+# Two console scripts on purpose: `taipan build examples/greeter` cannot guess
+# between them, so it is also the fixture for `-e`.
+[project.scripts]
+greet = "greeter.cli:main"
+greet-loud = "greeter.cli:loud"
