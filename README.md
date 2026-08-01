@@ -74,11 +74,9 @@ its own — including for a dependency that publishes no wheel and has to be
 compiled from source. That build uses the same CPython 3.13 that will run the
 code, and needs a C compiler on the machine (`cc`, or MSVC on Windows).
 
-On Windows this holds for wheels but not for building from source: a virtual
-environment there is created by copying a `python.exe` out of the base
-installation, which the embedded runtime does not have. Compiling a
-dependency falls back to an interpreter uv chooses, and downloads one if it
-finds none.
+One case on Windows still falls back to an interpreter uv chooses, and says
+so when it does: a package that *embeds* Python rather than extending it
+needs `python313.lib`, an import library the runtime does not carry.
 
 ### Standalone executables
 
