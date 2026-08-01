@@ -69,14 +69,15 @@ Installs are delegated to uv, found via `$TAIPAN_UV`, then `PATH`; if
 neither exists, taipan downloads a static copy into its cache once (this
 needs `curl` and `tar`). Scripts without dependencies never touch uv.
 
-uv is pointed at the embedded interpreter, so it never downloads a Python of
-its own — including for a dependency that publishes no wheel and has to be
-compiled from source. That build uses the same CPython 3.13 that will run the
-code, and needs a C compiler on the machine (`cc`, or MSVC on Windows).
+uv uses the embedded interpreter, so it never downloads a Python of its own.
+This includes dependencies that publish no wheel: they are compiled from
+source against the same CPython 3.13 that runs your code, and need a C
+compiler (`cc`, or MSVC on Windows).
 
-One case on Windows still falls back to an interpreter uv chooses, and says
-so when it does: a package that *embeds* Python rather than extending it
-needs `python313.lib`, an import library the runtime does not carry.
+The exception is on Windows, where a package that embeds Python needs
+`python313.lib`, an import library taipan does not ship. For those builds uv
+falls back to its own interpreter and downloads one if it finds none. taipan
+tells you when this happens.
 
 ### Standalone executables
 
@@ -108,34 +109,31 @@ time, and the last copy wins.
 
 ### Building a package
 
-`taipan build` also takes a project directory or any requirement uv
-understands, instead of a script. The package is installed with its
-dependencies, and the executable runs one of its console scripts:
+`taipan build` also accepts a project directory or any requirement uv
+understands. taipan installs the package with its dependencies, and the
+executable runs one of its console scripts:
 
 ```sh
 taipan build ./omniload -e omniload -o omniload   # from a local project
 taipan build 'omniload==0.7.0' -e omniload        # from a package registry
 ```
 
-`-e` names the console script, the same name a `pip install` would put on
-your `PATH`. It can be omitted when the package declares exactly one; when it
-declares several, taipan lists them and asks. The name is resolved from the
-installed `[console_scripts]` metadata — the same thing
-`importlib.metadata.entry_points()` reads — so there is no second copy of the
-dependency list to maintain. Only `console_scripts` are considered;
-`gui_scripts` and other entry point groups are not.
+Use `-e` to name the console script, the same name `pip install` would put on
+your `PATH`. Omit it if the package declares exactly one; if it declares
+several, taipan lists them and asks. Only `console_scripts` entry points are
+considered, not `gui_scripts`.
 
-For a package that declares no console script for what you want to run, `-e`
-also accepts an import target directly:
+If no console script does what you want, `-e` also accepts an import target:
 
 ```sh
 taipan build ./omniload -e omniload.main:main
 ```
 
-The output name defaults to the console script's name. Because a directory's
-contents change between builds, a local project is reinstalled on every build
-(uv's own cache keeps this cheap); a pinned requirement reuses taipan's
-cached environment, so keep it pinned if you want a rebuild to fetch nothing.
+The output name defaults to the console script's name.
+
+A local project is reinstalled on every build, since its contents may have
+changed; uv's cache keeps this cheap. A pinned requirement reuses taipan's
+cached environment, so pin the version if you want rebuilds to fetch nothing.
 
 ## How it works
 
@@ -146,11 +144,12 @@ bytecode is cached and startup modules are frozen into the runtime, so a warm
 start does almost no work. Threads and every `multiprocessing` start method
 are supported.
 
-`taipan build` appends the entry script — generated, for a package build —
-and its installed environment to a copy of the launcher, sealed with a digest
-that serves as both integrity check and cache key. On the target, the first
-launch verifies and extracts the payload; later launches read only the
-64-byte footer. A truncated or modified executable fails with a clear error.
+`taipan build` appends the entry script and its installed environment to a
+copy of the launcher, sealed with a digest that serves as both integrity
+check and cache key. For a package build, taipan generates the entry script.
+On the target, the first launch verifies and extracts the payload; later
+launches read only the 64-byte footer. A truncated or modified executable
+fails with a clear error.
 
 The cache lives at `~/.cache/taipan` (`%LOCALAPPDATA%\taipan` on Windows) and
 is disposable — deleting it costs one re-extraction on the next run. Set
@@ -178,11 +177,10 @@ day-to-day work inside a project, use uv.
 - Linux builds require glibc; musl (Alpine) is not supported yet.
 - Dependency sets are not locked — the first resolution wins and is cached.
   Pin versions in the PEP 723 block (`"httpx==0.28.1"`) for reproducibility.
-- A dependency with no wheel is compiled on the spot, against the build
-  machine's system libraries. Wheels from PyPI target manylinux's floor, so
-  they run anywhere taipan does; a locally compiled extension only runs on
-  systems at least as new as the one that built it. This matters for
-  `taipan build`, whose output is otherwise portable across machines.
+- A dependency with no wheel is compiled against the build machine's system
+  libraries, so the executable only runs on systems at least as new as the one
+  that built it. Wheels from PyPI target manylinux and carry no such
+  restriction.
 - Standard-library tracebacks show file and line but not source text, and
   code that expects stdlib modules to exist as ordinary files may fail.
   `tkinter`, `idlelib`, `venv`, and `ensurepip` are not included.
